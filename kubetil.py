@@ -9,6 +9,7 @@ import fnmatch
 import re
 import json
 import sys
+import shlex
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 from subprocess import run, CompletedProcess
@@ -37,9 +38,6 @@ def display(*args, index=None, json_output=False):
         todo()
     else:
         for i, kobj in enumerate(args, start=1):
-            # for atom in thing:
-            #     sys.stdout.write("{:<40}".format(atom))
-            # sys.stdout.write("\n")
             print(f"[{i:>2}]", kobj)
 
 def command(*args, capture: bool = False) -> CompletedProcess:
@@ -48,6 +46,9 @@ def command(*args, capture: bool = False) -> CompletedProcess:
 def lines(buffer: bytes) -> Iterator[str]:
     for line in buffer.decode("utf-8").split("\n"):
         yield line.strip()
+
+def tokenize(command: str) -> Iterator[str]:
+    return shlex.split(command)
 
 @contextmanager
 def kubectl(*args, **kwargs):
@@ -77,6 +78,12 @@ def head(thing):
         return next(iter(thing))
     return thing
 
+def take(lines: Iterator[str], n: int) -> Optional[str]:
+    for i, line in enumerate(lines, start=1):
+        if i == n:
+            return line
+    return None
+
 def singleton_only(f):
     @functools.wraps(f)
     def g(thing):
@@ -84,12 +91,6 @@ def singleton_only(f):
             raise ValueError("single value only")
         return f(thing)
     return g
-
-def take(lines: Iterator[str], n: int) -> Optional[str]:
-    for i, line in enumerate(lines, start=1):
-        if i == n:
-            return line
-    return None
 
 def columns(line: str) -> List[str]:
     return line.split()
@@ -127,11 +128,23 @@ def containers(namespace: str, type_: str, ident: str) -> Iterator[str]:
     with kubectl("get", "-n", namespace, type_, ident, "-o", jsonpath, capture=True) as lines:
         return head(lines).split(" ")
 
-def exec(namespace: str, type_: str, ident: str, cmd: str):
+def exec(namespace: str, type_: str, ident: str, command, host_env: bool = False):
     cs = containers(namespace, type_, ident)
     main_container = head([c for c in cs if "linkerd" not in c])
     container_args = ["-c", main_container] if len(main_container) > 0 else []
-    with kubectl("exec", "--stdin", "--tty", "-n", namespace, f"{type_}/{ident}", *container_args, "--", cmd) as cp:
+
+    env = {}
+    if host_env:
+        with kubectl("exec", "--stdin", "--tty", "-n", namespace, f"{type_}/{ident}", *container_args, "--", "env", capture=True) as lines:
+            for line in lines:
+                parts = line.split("=")
+                key = parts[0]
+                value = parts[1] if len(parts) > 1 else ""
+                env[key.strip()] = value.strip()
+
+    run_command = command(env) if callable(command) else command
+
+    with kubectl("exec", "--stdin", "--tty", "-n", namespace, f"{type_}/{ident}", *container_args, "--", *run_command) as cp:
         return cp
 
 def todo():
@@ -140,7 +153,8 @@ def todo():
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--json", action="store_true", default=False)
+    parser.add_argument("--json", action="store_true", default=False, dest="json")
+    parser.add_argument("-v", "--verbose", action="store_true", default=False, dest="verbose")
 
     def build_index_args(parser):
         for i in range(1, 10):
@@ -150,7 +164,10 @@ if __name__ == "__main__":
         p = parser.add_subparsers(help="verb", dest="verb")
         verbs = [
             NV("show-containers", "Show containers"),
-            NV("exec", "Shell operations", [("command", dict(help="Command to run"))])
+            NV("exec", "Shell operations", [("command", dict(help="Command to run"))]),
+            NV("env", "Print envvars"),
+            NV("shell", "Spawn a shell"),
+            NV("psql", "Open psql"),
         ]
         for v in verbs:
             pp = p.add_parser(v.name, help=f"Verb: {v.description}")
@@ -173,15 +190,30 @@ if __name__ == "__main__":
 
     build_index_args(parser)
     build_nouns(parser)
-    args = parser.parse_args()
-    print(args)
 
-    do_next = [args.noun, args.verb]
+    args = parser.parse_args()
+
+    do_next = []
+    if (noun := getattr(args, "noun", None)) is not None:
+        do_next.append(noun)
+    if (verb := getattr(args, "verb", None)) is not None:
+        do_next.append(verb)
+
+    if len(do_next) == 0:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.verbose:
+        print(args)
+
     actions = {
         "pods": lambda prev: grep_pods(args.pattern),
         "deployments": lambda prev: grep_deployments(args.pattern),
         "show-containers": singleton_only(lambda prev: containers(*prev.args)),
-        "exec": singleton_only(lambda prev: exec(*prev.args, args.command)),
+        "exec": singleton_only(lambda prev: exec(*prev.args, tokenize(args.command))),
+        "env": singleton_only(lambda prev: exec(*prev.args, tokenize("env"))),
+        "shell": singleton_only(lambda prev: exec(*prev.args, tokenize("/bin/sh"))),
+        "psql": singleton_only(lambda prev: exec(*prev.args, lambda env: tokenize(f"psql -U {env['POSTGRES_USER']}"), host_env=True)),
     }
 
     output, code, index = None, 0, args.index
