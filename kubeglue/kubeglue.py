@@ -15,6 +15,15 @@ from typing import Dict, Iterator, List, Optional, Tuple
 from subprocess import run, CompletedProcess
 
 
+def todo():
+    raise NotImplementedError
+
+
+class SingleValueException(Exception):
+    def __init__(self):
+        super().__init__("expected single value but got multiple values")
+
+
 @dataclass
 class NV:
     name: str
@@ -73,7 +82,7 @@ def kubectl(*args, **kwargs):
         yield cp
 
 
-def iterable(thing):
+def iterable(thing) -> bool:
     if isinstance(thing, str):
         return False
     if isinstance(thing, Iterable):
@@ -102,7 +111,7 @@ def singleton_only(f):
     @functools.wraps(f)
     def g(thing):
         if iterable(thing):
-            raise ValueError("single value only")
+            raise SingleValueException
         return f(thing)
 
     return g
@@ -136,8 +145,8 @@ def filter_objects(objects, type_, f) -> Iterator[KObject]:
             yield KObject(ns, ident, type_)
 
 
-def grep_objects(pat, type_, objects) -> Iterator[KObject]:
-    pat_regex = fnmatch.translate(pat)
+def grep_objects(pattern: str, type_: str, objects) -> Iterator[KObject]:
+    pat_regex = fnmatch.translate(pattern)
     return filter_objects(
         objects, type_, lambda _, ident: re.search(pat_regex, ident, re.I)
     )
@@ -214,10 +223,6 @@ def exec(
         return cp
 
 
-def todo():
-    raise NotImplementedError
-
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -244,17 +249,23 @@ if __name__ == "__main__":
         "-v", "--verbose", action="store_true", default=False, dest="verbose"
     )
 
+    # Supports -1 to -99
     def build_index_args(parser):
-        for i in range(1, 10):
+        for i in range(1, 100):
             parser.add_argument(
-                f"-{i}", action="store_const", const=i, required=False, dest="index"
+                f"-{i}",
+                action="store_const",
+                const=i,
+                required=False,
+                dest="index",
+                help=argparse.SUPPRESS,
             )
 
     def build_verbs(parser):
         p = parser.add_subparsers(help="verb", dest="verb")
         verbs = [
-            NV("show-containers", "Show containers"),
-            NV("exec", "Shell operations", [("command", dict(help="Command to run"))]),
+            NV("containers", "Show containers"),
+            NV("exec", "Run something", [("command", dict(help="Command to run"))]),
             NV("env", "Print envvars"),
             NV("shell", "Spawn a shell"),
             NV("psql", "Open psql"),
@@ -271,7 +282,7 @@ if __name__ == "__main__":
         nouns = [
             NV(
                 "pods",
-                "Pod operations",
+                "Pods",
                 [
                     (
                         "pattern",
@@ -284,7 +295,7 @@ if __name__ == "__main__":
             ),
             NV(
                 "deployments",
-                "Deployment operations",
+                "Deployments",
                 [
                     (
                         "pattern",
@@ -324,7 +335,7 @@ if __name__ == "__main__":
     actions = {
         "pods": lambda prev: grep_pods(args.pattern),
         "deployments": lambda prev: grep_deployments(args.pattern),
-        "show-containers": singleton_only(lambda prev: containers(*prev.args)),
+        "containers": singleton_only(lambda prev: containers(*prev.args)),
         "exec": singleton_only(
             lambda prev: exec(
                 *prev.args, tokenize(args.command), stdin=args.stdin, tty=args.tty
@@ -367,7 +378,13 @@ if __name__ == "__main__":
     while len(do_next) > 0:
         if (thing_to_do := do_next.pop(0)) is None:
             break
-        output = actions[thing_to_do](output)
+        try:
+            output = actions[thing_to_do](output)
+        except SingleValueException as e:
+            print(f"error: {e}!")
+            sys.exit(1)
+        except:
+            raise
         if index is not None:
             if iterable(output):
                 output = take(output, index)
