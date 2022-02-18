@@ -14,11 +14,13 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 from subprocess import run, CompletedProcess
 
+
 @dataclass
 class NV:
     name: str
     description: str
     arguments: List[Tuple[str, Dict[str, str]]] = field(default_factory=list)
+
 
 @dataclass
 class KObject:
@@ -33,22 +35,30 @@ class KObject:
     def __str__(self) -> str:
         return f"{self.ns}:{self.ident}"
 
+
 def display(*args, index=None, json_output=False):
     if json_output:
         todo()
     else:
-        for i, kobj in enumerate(args, start=1):
-            print(f"[{i:>2}]", kobj)
+        if len(args) == 1:
+            print(args[0])
+        else:
+            for i, kobj in enumerate(args, start=1):
+                print(f"[{i:>2}]", kobj)
+
 
 def command(*args, capture: bool = False) -> CompletedProcess:
-  return run(args, check=True, capture_output=capture)
+    return run(args, check=True, capture_output=capture)
+
 
 def lines(buffer: bytes) -> Iterator[str]:
     for line in buffer.decode("utf-8").split("\n"):
         yield line.strip()
 
+
 def tokenize(command: str) -> Iterator[str]:
     return shlex.split(command)
+
 
 @contextmanager
 def kubectl(*args, **kwargs):
@@ -62,6 +72,7 @@ def kubectl(*args, **kwargs):
     else:
         yield cp
 
+
 def iterable(thing):
     if isinstance(thing, str):
         return False
@@ -73,10 +84,12 @@ def iterable(thing):
     except:
         return False
 
+
 def head(thing):
     if iterable(thing):
         return next(iter(thing))
     return thing
+
 
 def take(lines: Iterator[str], n: int) -> Optional[str]:
     for i, line in enumerate(lines, start=1):
@@ -84,39 +97,59 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
             return line
     return None
 
+
 def singleton_only(f):
     @functools.wraps(f)
     def g(thing):
         if iterable(thing):
             raise ValueError("single value only")
         return f(thing)
+
     return g
+
+
+def find_postgres_user(env: Dict[str, str]) -> str:
+    candidates = ["POSTGRES_USER", "PG_USER", "DB_USER"]
+    for candidate in candidates:
+        if candidate in env:
+            return env[candidate]
+    raise Exception("env:no postgres user found")
+
 
 def columns(line: str) -> List[str]:
     return line.split()
+
 
 def get_all_pods() -> Iterator[str]:
     with kubectl("get", "pods", "-A", capture=True) as lines:
         return lines
 
+
 def get_all_deployments() -> Iterator[str]:
     with kubectl("get", "deployments", "-A", capture=True) as lines:
         return lines
+
 
 def filter_objects(objects, type_, f) -> Iterator[KObject]:
     for (ns, ident, *_) in (c for line in objects if len(c := columns(line)) > 0):
         if f(ns, ident):
             yield KObject(ns, ident, type_)
 
+
 def grep_objects(pat, type_, objects) -> Iterator[KObject]:
     pat_regex = fnmatch.translate(pat)
-    return filter_objects(objects, type_, lambda _, ident: re.search(pat_regex, ident, re.I))
+    return filter_objects(
+        objects, type_, lambda _, ident: re.search(pat_regex, ident, re.I)
+    )
 
-def grep_pods(pattern):
+
+def grep_pods(pattern: str):
     return grep_objects(pattern, "pod", get_all_pods())
 
-def grep_deployments(pattern):
+
+def grep_deployments(pattern: str):
     return grep_objects(pattern, "deployment", get_all_deployments())
+
 
 def containers(namespace: str, type_: str, ident: str) -> Iterator[str]:
     if type_ == "pod":
@@ -125,40 +158,97 @@ def containers(namespace: str, type_: str, ident: str) -> Iterator[str]:
         jsonpath = "jsonpath={.spec.template.spec.containers[*].name}"
     else:
         todo()
-    with kubectl("get", "-n", namespace, type_, ident, "-o", jsonpath, capture=True) as lines:
-        return head(lines).split(" ")
+    with kubectl(
+        "get", "-n", namespace, type_, ident, "-o", jsonpath, capture=True
+    ) as lines:
+        return columns(head(lines))
 
-def exec(namespace: str, type_: str, ident: str, command, host_env: bool = False):
+
+def exec(
+    namespace: str,
+    type_: str,
+    ident: str,
+    command,
+    stdin: bool = True,
+    tty: bool = True,
+    host_env: bool = False,
+):
     cs = containers(namespace, type_, ident)
+    # skip anything associated with linkerd:
     main_container = head([c for c in cs if "linkerd" not in c])
-    container_args = ["-c", main_container] if len(main_container) > 0 else []
+    with_container = ["-c", main_container] if len(main_container) > 0 else []
 
     env = {}
     if host_env:
-        with kubectl("exec", "--stdin", "--tty", "-n", namespace, f"{type_}/{ident}", *container_args, "--", "env", capture=True) as lines:
+        with kubectl(
+            "exec",
+            "-n",
+            namespace,
+            f"{type_}/{ident}",
+            *with_container,
+            "--",
+            "env",
+            capture=True,
+        ) as lines:
             for line in lines:
                 parts = line.split("=")
                 key = parts[0]
                 value = parts[1] if len(parts) > 1 else ""
                 env[key.strip()] = value.strip()
 
-    run_command = command(env) if callable(command) else command
+    with_stdin = ["--stdin"] if stdin else []
+    with_tty = ["--tty"] if tty else []
+    with_command = command(env) if callable(command) else command
 
-    with kubectl("exec", "--stdin", "--tty", "-n", namespace, f"{type_}/{ident}", *container_args, "--", *run_command) as cp:
+    with kubectl(
+        "exec",
+        *with_stdin,
+        *with_tty,
+        "-n",
+        namespace,
+        f"{type_}/{ident}",
+        *with_container,
+        "--",
+        *with_command,
+    ) as cp:
         return cp
+
 
 def todo():
     raise NotImplementedError
+
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true", default=False, dest="json")
-    parser.add_argument("-v", "--verbose", action="store_true", default=False, dest="verbose")
+    parser.add_argument(
+        "--nostdin",
+        action="store_false",
+        default=True,
+        dest="stdin",
+        help="Redirect stdin",
+    )
+    parser.add_argument(
+        "--notty", action="store_false", default=True, dest="tty", help="Use TTY mode"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=False,
+        dest="quiet",
+        help="Suppress extra output",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", default=False, dest="verbose"
+    )
 
     def build_index_args(parser):
         for i in range(1, 10):
-            parser.add_argument(f"-{i}", action="store_const", const=i, required=False, dest="index")
+            parser.add_argument(
+                f"-{i}", action="store_const", const=i, required=False, dest="index"
+            )
 
     def build_verbs(parser):
         p = parser.add_subparsers(help="verb", dest="verb")
@@ -168,18 +258,43 @@ if __name__ == "__main__":
             NV("env", "Print envvars"),
             NV("shell", "Spawn a shell"),
             NV("psql", "Open psql"),
+            NV("pg-dump-schema", "Dump the schema of the Postgres database"),
         ]
         for v in verbs:
             pp = p.add_parser(v.name, help=f"Verb: {v.description}")
-            for name, kws in  v.arguments:
+            for name, kws in v.arguments:
                 pp.add_argument(name, **kws)
             # build_index_args(pp)
 
     def build_nouns(parser):
         p = parser.add_subparsers(help="noun", dest="noun")
         nouns = [
-            NV("pods", "Pod operations", [("pattern", dict(help="Glob pattern"))]),
-            NV("deployments", "Deployment operations", [("pattern", dict(help="Glob pattern"))])
+            NV(
+                "pods",
+                "Pod operations",
+                [
+                    (
+                        "pattern",
+                        dict(
+                            metavar="glob-pattern",
+                            help="Glob pattern, e.g. 'foo*', 'processor*db*deploy*'",
+                        ),
+                    )
+                ],
+            ),
+            NV(
+                "deployments",
+                "Deployment operations",
+                [
+                    (
+                        "pattern",
+                        dict(
+                            metavar="glob-pattern",
+                            help="Glob search pattern, e.g 'foo*, processor*db*deploy*'",
+                        ),
+                    )
+                ],
+            ),
         ]
         for n in nouns:
             pp = p.add_parser(n.name, help=f"Noun: {n.description}")
@@ -210,10 +325,41 @@ if __name__ == "__main__":
         "pods": lambda prev: grep_pods(args.pattern),
         "deployments": lambda prev: grep_deployments(args.pattern),
         "show-containers": singleton_only(lambda prev: containers(*prev.args)),
-        "exec": singleton_only(lambda prev: exec(*prev.args, tokenize(args.command))),
-        "env": singleton_only(lambda prev: exec(*prev.args, tokenize("env"))),
-        "shell": singleton_only(lambda prev: exec(*prev.args, tokenize("/bin/sh"))),
-        "psql": singleton_only(lambda prev: exec(*prev.args, lambda env: tokenize(f"psql -U {env['POSTGRES_USER']}"), host_env=True)),
+        "exec": singleton_only(
+            lambda prev: exec(
+                *prev.args, tokenize(args.command), stdin=args.stdin, tty=args.tty
+            )
+        ),
+        "env": singleton_only(
+            lambda prev: exec(
+                *prev.args, tokenize("env"), stdin=args.stdin, tty=args.tty
+            )
+        ),
+        "shell": singleton_only(
+            lambda prev: exec(
+                *prev.args, tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty
+            )
+        ),
+        "psql": singleton_only(
+            lambda prev: exec(
+                *prev.args,
+                lambda env: ["psql"]
+                + (["--quiet", "-t"] if args.quiet else [])
+                + ["-U", find_postgres_user(env)],
+                stdin=args.stdin,
+                tty=args.tty,
+                host_env=True,
+            )
+        ),
+        "pg-dump-schema": singleton_only(
+            lambda prev: exec(
+                *prev.args,
+                lambda env: tokenize(f"pg_dump -s -U {find_postgres_user(env)}"),
+                stdin=args.stdin,
+                tty=args.tty,
+                host_env=True,
+            )
+        ),
     }
 
     output, code, index = None, 0, args.index
@@ -230,12 +376,12 @@ if __name__ == "__main__":
             index = None
 
     if output is not None:
-        if iterable(output):
-            display(*output)
-        else:
-            display(output)
+        if not args.quiet:
+            if iterable(output):
+                display(*output)
+            else:
+                display(output)
     else:
         code = 1
 
     sys.exit(code)
-
