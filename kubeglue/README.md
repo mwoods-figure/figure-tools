@@ -73,7 +73,6 @@ $ kubectl glue deployments "*process*bank*db*"
 [11] figurepay:processor-uw-bankcredit-db-deployment
 
 # The same works with pods as well:
-
 $ kubectl glue pods "*process*bank*db*"
 >
 [ 1] figurepay:processor-aml-bank-db-deployment-6cd548b85f-xvzpc
@@ -93,14 +92,12 @@ $ kubectl glue pods "*process*bank*db*"
 [15] figurepay:processor-uw-bankcredit-db-deployment-7d459cb5d-s7dkz
 
 # Show containers
-
 $ kubectl glue deployments "*processor-uw-bankcredit*" -3 containers
 >
 processor-uw-bankcredit
 
 # We can build a simple pipeline of actions:
-
-# Take the 7th result:
+# Take the 7th result (in general, indices -1 through -99 are supported)
 $ kubectl glue deployments "*process*bank*db*" -7
 >
 figurepay:processor-id-verification-bank-db-deployment
