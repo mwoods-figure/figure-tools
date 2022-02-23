@@ -19,6 +19,16 @@ def todo():
     raise NotImplementedError
 
 
+def abort(message: str):
+    print(f"error: {message}")
+    sys.exit(1)
+
+
+def require(predicate: bool, message: str):
+    if not predicate:
+        abort(message)
+
+
 class SingleValueException(Exception):
     def __init__(self):
         super().__init__("expected single value but got multiple values")
@@ -139,7 +149,7 @@ def get_all_deployments() -> Iterator[str]:
         return lines
 
 
-def filter_objects(objects, type_, f) -> Iterator[KObject]:
+def filter_objects(objects, type_: str, f) -> Iterator[KObject]:
     for (ns, ident, *_) in (c for line in objects if len(c := columns(line)) > 0):
         if f(ns, ident):
             yield KObject(ns, ident, type_)
@@ -173,6 +183,23 @@ def containers(namespace: str, type_: str, ident: str) -> Iterator[str]:
         return columns(head(lines))
 
 
+def main_container(namespace: str, type_: str, ident: str):
+    skip = {"linkerd"}
+    return head([c for c in containers(namespace, type_, ident) if c not in skip])
+
+
+def copy(namespace: str, type_: str, ident: str, src: str, dest: str):
+    main_c = main_container(namespace, type_, ident)
+    with_container = ["-c", main_c] if len(main_c) > 0 else []
+
+    require(type_ == "pod", "{type_} not supported for copy")
+
+    with kubectl(
+        "cp", src, f"{namespace}/{ident}:{dest}", *with_container, capture=False
+    ) as proc:
+        return proc
+
+
 def exec(
     namespace: str,
     type_: str,
@@ -182,10 +209,8 @@ def exec(
     tty: bool = True,
     host_env: bool = False,
 ):
-    cs = containers(namespace, type_, ident)
-    # skip anything associated with linkerd:
-    main_container = head([c for c in cs if "linkerd" not in c])
-    with_container = ["-c", main_container] if len(main_container) > 0 else []
+    main_c = main_container(namespace, type_, ident)
+    with_container = ["-c", main_c] if len(main_c) > 0 else []
 
     env = {}
     if host_env:
@@ -219,8 +244,8 @@ def exec(
         *with_container,
         "--",
         *with_command,
-    ) as cp:
-        return cp
+    ) as proc:
+        return proc
 
 
 if __name__ == "__main__":
@@ -232,10 +257,10 @@ if __name__ == "__main__":
         action="store_false",
         default=True,
         dest="stdin",
-        help="Redirect stdin",
+        help="Disable stdin redirection",
     )
     parser.add_argument(
-        "--notty", action="store_false", default=True, dest="tty", help="Use TTY mode"
+        "--notty", action="store_false", default=True, dest="tty", help="Disable TTY"
     )
     parser.add_argument(
         "-q",
@@ -265,6 +290,14 @@ if __name__ == "__main__":
         p = parser.add_subparsers(help="verb", dest="verb")
         verbs = [
             NV("containers", "Show containers"),
+            NV(
+                "cp",
+                "Copy files",
+                [
+                    ("src", dict(help="Copy source")),
+                    ("dest", dict(help="Copy destination")),
+                ],
+            ),
             NV("exec", "Run something", [("command", dict(help="Command to run"))]),
             NV("env", "Print envvars"),
             NV("shell", "Spawn a shell"),
@@ -336,6 +369,7 @@ if __name__ == "__main__":
         "pods": lambda prev: grep_pods(args.pattern),
         "deployments": lambda prev: grep_deployments(args.pattern),
         "containers": singleton_only(lambda prev: containers(*prev.args)),
+        "cp": singleton_only(lambda prev: todo()),
         "exec": singleton_only(
             lambda prev: exec(
                 *prev.args, tokenize(args.command), stdin=args.stdin, tty=args.tty
@@ -379,10 +413,11 @@ if __name__ == "__main__":
         if (thing_to_do := do_next.pop(0)) is None:
             break
         try:
+            if thing_to_do not in actions:
+                abort(f"Invalid action: {thing_to_do}")
             output = actions[thing_to_do](output)
         except SingleValueException as e:
-            print(f"error: {e}!")
-            sys.exit(1)
+            abort(e)
         except:
             raise
         if index is not None:
