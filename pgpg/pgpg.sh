@@ -25,5 +25,5 @@ docker run -d \
 
 sleep 2
 
-PGPASSWORD=$PASSWORD psql -h localhost -U postgres -p $PORT postgres
+PGPASSWORD=$PASSWORD psql -h localhost -U postgres -p $PORT postgres < /dev/stdin
 
