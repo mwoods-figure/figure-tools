@@ -11,7 +11,7 @@ import json
 import sys
 import shlex
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 from subprocess import run, CompletedProcess
 
 
@@ -47,6 +47,14 @@ class KObject:
     type_: str
     headers: List[str]
     attributes: Dict[str, str] = field(init=False)
+
+    @property
+    def is_pod(self) -> bool:
+        return self.type_ == "pod"
+
+    @property
+    def is_deployment(self) -> bool:
+        return self.type_ == "deployment"
 
     def __post_init__(self):
         values = columns(self.line)
@@ -127,14 +135,23 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
     return None
 
 
-def singleton_only(f):
-    @functools.wraps(f)
-    def g(thing):
-        if iterable(thing):
+def singleton_only(thing):
+    if callable(thing):
+        @functools.wraps(thing)
+        def f(x):
+            if iterable(x):
+                raise SingleValueException
+            return thing(x)
+        return f
+    elif iterable(thing):
+        it = iter(thing)
+        first = next(it, None)
+        second = next(it, None)
+        if second is None:
+            return first
+        else:
             raise SingleValueException
-        return f(thing)
-
-    return g
+    return thing
 
 
 def find_postgres_user(env: Dict[str, str]) -> str:
@@ -149,15 +166,18 @@ def columns(line: str) -> List[str]:
     return line.split()
 
 
-def get_all_pods() -> Iterator[KObject]:
+def get_pods(selector: Optional[str] = None) -> Iterator[KObject]:
     headers = ["namespace", "name", "ready", "status", "restarts", "age"]
-    with kubectl("get", "pods", "-A", capture=True) as lines:
+    with_selector = [f"--selector={selector}"] if selector is not None else []
+    with kubectl(
+        "get", "pods", "-A", "--no-headers=true", *with_selector, capture=True
+    ) as lines:
         return (
             KObject(line, "pod", headers) for line in lines if len(line.strip()) > 0
         )
 
 
-def get_all_deployments() -> Iterator[KObject]:
+def get_deployments() -> Iterator[KObject]:
     headers = [
         "namespace",
         "name",
@@ -169,7 +189,9 @@ def get_all_deployments() -> Iterator[KObject]:
         "images",
         "selector",
     ]
-    with kubectl("get", "deployments", "-A", "-o", "wide", capture=True) as lines:
+    with kubectl(
+        "get", "deployments", "-A", "--no-headers=true", "-o", "wide", capture=True
+    ) as lines:
         return (
             KObject(line, "deployment", headers)
             for line in lines
@@ -178,24 +200,27 @@ def get_all_deployments() -> Iterator[KObject]:
 
 
 def grep_objects(
-    pattern: str, type_: str, objects: Iterator[KObject]
+    pattern: str, objects: Iterator[KObject], transform=lambda o: o.line
 ) -> Iterator[KObject]:
-    pat_regex = re.compile(fnmatch.translate(pattern), re.I)
-    return (o for o in objects if re.search(pat_regex, o.line))
+    regex = re.compile(fnmatch.translate(pattern), re.I)
+    return (o for o in objects if re.search(regex, transform(o)))
 
 
-def grep_pods(pattern: str):
-    return grep_objects(pattern, "pod", get_all_pods())
+def grep_pods(pattern_or_kobj: Union[str, KObject]) -> Iterator[KObject]:
+    if isinstance(pattern_or_kobj, KObject):
+        require(pattern_or_kobj.is_deployment, "deployment object expected")
+        return grep_objects("*", get_pods(pattern_or_kobj.selector))
+    return grep_objects(pattern_or_kobj, get_pods())
 
 
-def grep_deployments(pattern: str):
-    return grep_objects(pattern, "deployment", get_all_deployments())
+def grep_deployments(pattern: str) -> Iterator[KObject]:
+    return grep_objects(pattern, get_deployments())
 
 
 def containers(kobj: KObject) -> Iterator[str]:
-    if kobj.type_ == "pod":
+    if kobj.is_pod:
         jsonpath = "jsonpath={.spec.containers[*].name}"
-    elif kobj.type_ == "deployment":
+    elif kobj.is_deployment:
         jsonpath = "jsonpath={.spec.template.spec.containers[*].name}"
     else:
         todo()
@@ -210,16 +235,20 @@ def main_container(kobj: KObject):
     return head([c for c in containers(kobj) if c not in skip])
 
 
-def copy(kobj: KObject):
+def copy(kobj: KObject, src: str, dest: str):
     main_c = main_container(kobj)
     with_container = ["-c", main_c] if len(main_c) > 0 else []
 
-    require(kobj.type_ == "pod", "{kobj.type_} not supported for copy")
+    if kobj.is_pod:
+        pod = kobj.name
+    else:
+        # assumed to be a deployment:
+        pod = singleton_only(get_pods(kobj.selector)).name
 
     with kubectl(
         "cp",
         src,
-        f"{kobj.namespace}/{kobj.name}:{dest}",
+        f"{kobj.namespace}/{pod}:{dest}",
         *with_container,
         capture=False,
     ) as proc:
@@ -318,6 +347,7 @@ if __name__ == "__main__":
                     ("dest", dict(help="Copy destination")),
                 ],
             ),
+            NV("pods", "List pods"),
             NV("exec", "Run something", [("command", dict(help="Command to run"))]),
             NV("env", "Print envvars"),
             NV("shell", "Spawn a shell"),
@@ -386,13 +416,13 @@ if __name__ == "__main__":
         print(args)
 
     actions = {
-        "pods": lambda _: grep_pods(args.pattern),
+        "pods": lambda last: grep_pods(last if last is not None else args.pattern),
         "deployments": lambda _: grep_deployments(args.pattern),
         "containers": singleton_only(lambda last: containers(last)),
-        "cp": singleton_only(lambda _: todo()),
+        "cp": singleton_only(lambda last: copy(last, args.src, args.dest)),
         "exec": singleton_only(
             lambda last: exec(
-                last, tokenize(rgs.command), stdin=args.stdin, tty=args.tty
+                last, tokenize(args.command), stdin=args.stdin, tty=args.tty
             )
         ),
         "env": singleton_only(
