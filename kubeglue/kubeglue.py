@@ -202,7 +202,14 @@ def get_deployments() -> Iterator[KObject]:
 def grep_objects(
     pattern: str, objects: Iterator[KObject], transform=lambda o: o.line
 ) -> Iterator[KObject]:
-    regex = re.compile(fnmatch.translate(pattern), re.I)
+    # it's useful to prepend+append "*" to the pattern if they're not there because
+    # this usually the intention:
+    p = pattern.strip()
+    if not p.startswith("*"):
+        p = "*" + p
+    if not p.endswith("*"):
+        p += "*"
+    regex = re.compile(fnmatch.translate(p), re.I)
     return (o for o in objects if re.search(regex, transform(o)))
 
 
