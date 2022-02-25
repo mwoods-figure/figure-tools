@@ -7,7 +7,7 @@ from collections.abc import Iterable
 import itertools
 import fnmatch
 import re
-import json
+import json as pyjson
 import sys
 import shlex
 from dataclasses import dataclass, field
@@ -56,6 +56,9 @@ class KObject:
     def is_deployment(self) -> bool:
         return self.type_ == "deployment"
 
+    def to_json(self) -> str:
+        return pyjson.dumps(self.attributes)
+
     def __post_init__(self):
         values = columns(self.line)
         self.attributes = dict(zip(self.headers, values))
@@ -70,18 +73,21 @@ class KObject:
         return self.line
 
 
-def display(*args, index=None, json_output=False):
-    def is_primitive(thing):
+def display(*args, index=None, json=False):
+    def is_primitive(thing) -> bool:
         return isinstance(thing, (type(None), bool, float, int, str))
 
-    if json_output:
-        todo()
-    else:
-        if len(args) == 1:
-            print(args[0] if is_primitive(args[0]) else repr(args[0]))
+    def prepare(thing, json: bool = False) -> str:
+        if json:
+            return pyjson.dumps(thing) if is_primitive(thing) else thing.to_json()
         else:
-            for i, kobj in enumerate(args, start=1):
-                print(f"[{i:>2}]", kobj if is_primitive(kobj) else repr(kobj))
+            return thing if is_primitive(thing) else repr(thing)
+
+    if len(args) == 1:
+        print(prepare(args[0], json=json))
+    else:
+        for i, kobj in enumerate(args, start=1):
+            print(f"[{i:>2}] {prepare(kobj, json=json)}")
 
 
 def command(*args, capture: bool = False) -> CompletedProcess:
@@ -124,7 +130,7 @@ def iterable(thing) -> bool:
 
 def head(thing):
     if iterable(thing):
-        return next(iter(thing))
+        return next(iter(thing), None)
     return thing
 
 
@@ -137,11 +143,13 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
 
 def singleton_only(thing):
     if callable(thing):
+
         @functools.wraps(thing)
         def f(x):
             if iterable(x):
                 raise SingleValueException
             return thing(x)
+
         return f
     elif iterable(thing):
         it = iter(thing)
@@ -200,7 +208,7 @@ def get_deployments() -> Iterator[KObject]:
 
 
 def grep_objects(
-    pattern: str, objects: Iterator[KObject], transform=lambda o: o.line
+    pattern: str, kobjs: Iterator[KObject], transform=lambda o: o.line
 ) -> Iterator[KObject]:
     # it's useful to prepend+append "*" to the pattern if they're not there because
     # this usually the intention:
@@ -210,14 +218,18 @@ def grep_objects(
     if not p.endswith("*"):
         p += "*"
     regex = re.compile(fnmatch.translate(p), re.I)
-    return (o for o in objects if re.search(regex, transform(o)))
+    return (o for o in kobjs if re.search(regex, transform(o)))
 
 
-def grep_pods(pattern_or_kobj: Union[str, KObject]) -> Iterator[KObject]:
-    if isinstance(pattern_or_kobj, KObject):
-        require(pattern_or_kobj.is_deployment, "deployment object expected")
-        return grep_objects("*", get_pods(pattern_or_kobj.selector))
-    return grep_objects(pattern_or_kobj, get_pods())
+def grep_pods(
+    pattern: Union[str, KObject], kobj: Optional[KObject] = None
+) -> Iterator[KObject]:
+    if kobj is not None:
+        require(kobj.is_deployment, "deployment object expected")
+        pods = get_pods(kobj.selector)
+    else:
+        pods = get_pods()
+    return grep_objects(pattern, pods)
 
 
 def grep_deployments(pattern: str) -> Iterator[KObject]:
@@ -237,20 +249,24 @@ def containers(kobj: KObject) -> Iterator[str]:
         return columns(head(lines))
 
 
-def main_container(kobj: KObject):
+def primary_container(kobj: KObject) -> Optional[str]:
     skip = {"linkerd", "linkerd-proxy"}
     return head([c for c in containers(kobj) if c not in skip])
 
 
-def copy(kobj: KObject, src: str, dest: str):
-    main_c = main_container(kobj)
-    with_container = ["-c", main_c] if len(main_c) > 0 else []
-
+def primary_pod(kobj: KObject) -> KObject:
     if kobj.is_pod:
-        pod = kobj.name
+        return kobj
     else:
         # assumed to be a deployment:
-        pod = singleton_only(get_pods(kobj.selector)).name
+        return singleton_only(get_pods(kobj.selector))
+
+
+def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
+    container = primary_container(kobj)
+    with_container = ["-c", container] if container else []
+
+    pod = primary_pod(kobj)
 
     with kubectl(
         "cp",
@@ -262,11 +278,42 @@ def copy(kobj: KObject, src: str, dest: str):
         return proc
 
 
+def parse_portspec(portspec: str) -> Tuple[Optional[int], int]:
+    """
+    "8888:9999" :: [host-port:8888, pod-port:9999]
+    ":9999"     :: [*random*, pod-port:9999] (k8s chooses a random host port)
+    "9999"      :: [host-port:9999, pod-port:9999]
+    """
+    ps = portspec.strip()
+    if ps.startswith(":"):
+        return (None, int(ps.lstrip(":")))
+    else:
+        if ":" in ps:
+            return tuple(map(int, ps.split(":")))
+        else:
+            return (int(ps), int(ps))
+
+
+def port_forward(kobj: KObject, host_port: Optional[int], pod_port: int) -> CompletedProcess:
+    specifier = f"{kobj.type_}/{kobj.name}"
+    print(specifier)
+    with_host_port = "" if host_port is None else host_port
+    with_pod_port = pod_port
+    with kubectl(
+        "port-forward",
+        "-n",
+        kobj.namespace,
+        specifier,
+        f"{with_host_port}:{with_pod_port}",
+    ) as proc:
+        return proc
+
+
 def exec(
     kobj: KObject, command, stdin: bool = True, tty: bool = True, host_env: bool = False
 ):
-    main_c = main_container(kobj)
-    with_container = ["-c", main_c] if len(main_c) > 0 else []
+    container = primary_container(kobj)
+    with_container = ["-c", container] if container else []
 
     env = {}
     if host_env:
@@ -357,6 +404,16 @@ if __name__ == "__main__":
             NV("pods", "List pods"),
             NV("exec", "Run something", [("command", dict(help="Command to run"))]),
             NV("env", "Print envvars"),
+            NV(
+                "port-forward",
+                "Port forward",
+                [
+                    (
+                        "portspec",
+                        dict(help="Port specifier: either <host>:<pod> or :<pod>"),
+                    )
+                ],
+            ),
             NV("shell", "Spawn a shell"),
             NV("psql", "Open psql"),
             NV("pg-dump-schema", "Dump the schema of the Postgres database"),
@@ -423,7 +480,7 @@ if __name__ == "__main__":
         print(args)
 
     actions = {
-        "pods": lambda last: grep_pods(last if last is not None else args.pattern),
+        "pods": lambda last: grep_pods(args.pattern, last),
         "deployments": lambda _: grep_deployments(args.pattern),
         "containers": singleton_only(lambda last: containers(last)),
         "cp": singleton_only(lambda last: copy(last, args.src, args.dest)),
@@ -434,6 +491,9 @@ if __name__ == "__main__":
         ),
         "env": singleton_only(
             lambda last: exec(last, tokenize("env"), stdin=args.stdin, tty=args.tty)
+        ),
+        "port-forward": singleton_only(
+            lambda last: port_forward(last, *parse_portspec(args.portspec))
         ),
         "shell": singleton_only(
             lambda last: exec(last, tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty)
@@ -466,8 +526,6 @@ if __name__ == "__main__":
         if (thing_to_do := do_next.pop(0)) is None:
             break
         try:
-            if thing_to_do not in actions:
-                abort(f"Invalid action: {thing_to_do}")
             output = actions[thing_to_do](output)
         except SingleValueException as e:
             abort(e)
@@ -483,9 +541,9 @@ if __name__ == "__main__":
     if output is not None:
         if not args.quiet:
             if iterable(output):
-                display(*output)
+                display(*output, json=args.json)
             else:
-                display(output)
+                display(output, json=args.json)
     else:
         code = 1
 
