@@ -4,7 +4,7 @@ import argparse
 import functools
 from contextlib import contextmanager
 from collections.abc import Iterable
-import itertools
+from itertools import tee
 import fnmatch
 import re
 import json as pyjson
@@ -99,7 +99,9 @@ def lines(buffer: bytes) -> Iterator[str]:
         yield line.strip()
 
 
-def tokenize(command: str) -> Iterator[str]:
+def tokenize(command: Union[str, Iterator[str]]) -> Iterator[str]:
+    if iterable(command):
+        return command
     return shlex.split(command)
 
 
@@ -142,23 +144,29 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
 
 
 def singleton_only(thing):
-    if callable(thing):
+    def has_second(g):
+        it = iter(g)
+        first = next(it, None)
+        second = next(it, None)
+        return first is None or second is not None
 
+    if callable(thing):
         @functools.wraps(thing)
         def f(x):
             if iterable(x):
-                raise SingleValueException
-            return thing(x)
-
+                xs = list(x)
+                if has_second(xs):
+                    raise SingleValueException
+                return thing(head(xs))
+            else:
+                return thing(x)
         return f
     elif iterable(thing):
-        it = iter(thing)
-        first = next(it, None)
-        second = next(it, None)
-        if second is None:
-            return first
-        else:
+        xs = list(thing)
+        if has_second(xs):
             raise SingleValueException
+        return head(xs)
+    # already a scalar:
     return thing
 
 
@@ -402,7 +410,7 @@ if __name__ == "__main__":
                 ],
             ),
             NV("pods", "List pods"),
-            NV("exec", "Run something", [("command", dict(help="Command to run"))]),
+            NV("exec", "Run something", [("command", dict(nargs=argparse.REMAINDER, help="Command to run"))]),
             NV("env", "Print envvars"),
             NV(
                 "port-forward",
