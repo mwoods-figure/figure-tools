@@ -8,7 +8,7 @@ Glue together pieces of `kubectl` to do useful stuff.
 2. Make `kubeglue.py` executeable with `chmod +x kubeglue.py` 
 3. Create a symlink in`$PATH` to `kubeglue.py`, naming the symlink `kubectl-glue`:
     ```bash
-    $ ln -s /usr/local/bin/kubectl-glue /some/directory/lubeglue.py
+    $ ln -s /usr/local/bin/kubectl-glue /some/directory/kubeglue.py
     ```
 4. Verify the plugin is installed
     ```bash
@@ -27,7 +27,8 @@ Glue together pieces of `kubectl` to do useful stuff.
 
 ```bash
 
-# With no arguments `kubeglue.py` displays the help menu.
+# With no arguments `kubeglue.py` displays the help menu:
+
 $ kubectl glue 
 > 
 usage: kubectl-glue [-h] [--json] [--nostdin] [--notty] [-q] [-v] {pods,deployments} ...
@@ -46,6 +47,7 @@ optional arguments:
   -v, --verbose
 
 # Get help on a particular subcommand:
+
 $ kubectl glue deployments --help
 >
 usage: kubectl-glue deployments [-h]
@@ -71,6 +73,7 @@ optional arguments:
   -h, --help            show this help message and exit
 
 # Show all deployments across all namespaces with a name matching the pattern: 
+
 $ kubectl glue deployments "*process*bank*db*"
 >
 [ 1] figurepay:processor-aml-bank-db-deployment
@@ -86,6 +89,7 @@ $ kubectl glue deployments "*process*bank*db*"
 [11] figurepay:processor-uw-bankcredit-db-deployment
 
 # The same works with pods as well:
+
 $ kubectl glue pods "*process*bank*db*"
 >
 [ 1] figurepay:processor-aml-bank-db-deployment-6cd548b85f-xvzpc
@@ -109,19 +113,21 @@ $ kubectl glue pods "*process*bank*db*"
 # Here, we can build a simple pipeline of actions by specifying an index
 # argument. An index is just an argument: -1, -42, -99, etc.
 # (In general, indices 1 through 99 are supported)
-#
+
 $ kubectl glue pods "processor-uw-bankcredit" -3 containers
 >
 processor-uw-bankcredit
 
 # We can build a simple pipeline of actions. Here, we take the 7th result. 
 # The default action is to print out the thing that was indexed.
+
 $ kubectl glue deployments "process*bank*db" -7
 >
 figurepay:processor-id-verification-bank-db-deployment
 
 # Next, we can apply an action to the selected index:
 # Connect to Postgres with psql on the 7th result:
+
 $ kubectl glue deployments "process*bank*db" -7 psql
 > 
 psql (13.4 (Debian 13.4-1.pgdg100+1))
@@ -137,6 +143,7 @@ $ kubectl glue pods "processor-uw-bankcredit-db-deployment*"
 figurepay:processor-uw-bankcredit-db-deployment-7d459cb5d-s7dkz
 
 # Describing the pod works, since one result is returned:
+
 $ kubectl glue pods "processor-uw-bankcredit-db-deployment" describe
 >
 [ 1] namespace: figurepay
@@ -149,11 +156,13 @@ $ kubectl glue pods "processor-uw-bankcredit-db-deployment" describe
 ### More examples ###
 
 # Execute a SQL script through psql:
+
 $ cat myscript.sql | kubectl glue --notty deployments "process*bank*db" -7 psql
 > 
 ...
 
 # Show environment variables on the pod at index 7 of the listing:
+
 $ kubectl glue deployments "process*bank*db" -7 env
 > 
 GOSU_VERSION=1.12
@@ -163,20 +172,24 @@ PG_VERSION=13.4-1.pgdg100+1
 ...
 
 # Start a shell on the pod at index 7 of the listing:
+
 $ kubectl glue deployments "process*bank*db" -7 shell
 > 
 $
 
 # Execute a command, suppressing extra output with -q/--quiet. We can pipe input
 # from the local machine to the pod by making the call non interactive with --notty:
+
 $ cat README.md | kubectl glue --quiet --notty deployments "process*bank*db" -7 exec "wc -l"
 > 
 68
 
 # Forward port 5432 on the pod at index 7 in the listing, to local port 13337:
+
 $ kubectl glue deployments "process*bank*db" -7 port-forward 13337:5432 
 
 # Forward port 5432 on the pod at index 7 in the listing, to local port 5432:
+
 $ kubectl glue deployments "process*bank*db" -7 port-forward 5432
 ```
 
