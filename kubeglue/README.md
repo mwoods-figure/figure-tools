@@ -138,13 +138,13 @@ processor-id-verification-bank=#
 # Note, if the pattern is specific enough such that only one result is found,
 # an index like -1 is not necessary:
 
-$ kubectl glue pods "processor-uw-bankcredit-db-deployment*"
+$ kubectl glue pods "processor-uw-bankcredit-db-deployment"
 > 
 figurepay:processor-uw-bankcredit-db-deployment-7d459cb5d-s7dkz
 
 # Describing the pod works, since one result is returned:
 
-$ kubectl glue pods "processor-uw-bankcredit-db-deployment" describe
+$ kubectl glue pods "processor-uw-bankcredit-deployment" describe
 >
 [ 1] namespace: figurepay
 [ 2] name: processor-uw-bankcredit-db-deployment-7d459cb5d-s7dkz
@@ -152,6 +152,12 @@ $ kubectl glue pods "processor-uw-bankcredit-db-deployment" describe
 [ 4] status: Running
 [ 5] restarts: 0
 [ 6] age: 62d
+
+# If you try to run an action on more than one result, it's an error:
+
+$ kubectl glue pods "processor-uw-*" describe
+>
+error: expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]
 
 ### More examples ###
 
