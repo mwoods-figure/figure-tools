@@ -31,7 +31,7 @@ def require(predicate: bool, message: str):
 
 class SingleValueException(Exception):
     def __init__(self):
-        super().__init__("expected single value but got multiple values")
+        super().__init__("expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]")
 
 
 @dataclass
@@ -146,9 +146,11 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
 def singleton_only(thing):
     def has_second(g):
         it = iter(g)
-        first = next(it, None)
-        second = next(it, None)
-        return first is None or second is not None
+        first_end, second_end = object(), object()
+        first = next(it, first_end)
+        if first == first_end:
+            return False
+        return next(it, second_end) != second_end
 
     if callable(thing):
         @functools.wraps(thing)
@@ -157,7 +159,8 @@ def singleton_only(thing):
                 xs = list(x)
                 if has_second(xs):
                     raise SingleValueException
-                return thing(head(xs))
+                # If nothing left, return None to stop
+                return None if len(xs) == 0 else thing(head(xs))
             else:
                 return thing(x)
         return f
@@ -244,6 +247,10 @@ def grep_deployments(pattern: str) -> Iterator[KObject]:
     return grep_objects(pattern, get_deployments())
 
 
+def describe(kobj: KObject) -> Iterator[str]:
+    return (f"{key}: {value}" for key, value in kobj.attributes.items())
+
+
 def containers(kobj: KObject) -> Iterator[str]:
     if kobj.is_pod:
         jsonpath = "jsonpath={.spec.containers[*].name}"
@@ -304,7 +311,6 @@ def parse_portspec(portspec: str) -> Tuple[Optional[int], int]:
 
 def port_forward(kobj: KObject, host_port: Optional[int], pod_port: int) -> CompletedProcess:
     specifier = f"{kobj.type_}/{kobj.name}"
-    print(specifier)
     with_host_port = "" if host_port is None else host_port
     with_pod_port = pod_port
     with kubectl(
@@ -401,6 +407,7 @@ if __name__ == "__main__":
         p = parser.add_subparsers(help="verb", dest="verb")
         verbs = [
             NV("containers", "Show containers"),
+            NV("describe", "Describe object"),
             NV(
                 "cp",
                 "Copy files",
@@ -424,7 +431,7 @@ if __name__ == "__main__":
             ),
             NV("shell", "Spawn a shell"),
             NV("psql", "Open psql"),
-            NV("pg-dump-schema", "Dump the schema of the Postgres database"),
+            NV("pg-dump-schema", "Dump the schema of a Postgres database"),
         ]
         for v in verbs:
             pp = p.add_parser(v.name, help=f"Verb: {v.description}")
@@ -497,6 +504,7 @@ if __name__ == "__main__":
                 last, tokenize(args.command), stdin=args.stdin, tty=args.tty
             )
         ),
+        "describe": singleton_only(lambda last: describe(last)),
         "env": singleton_only(
             lambda last: exec(last, tokenize("env"), stdin=args.stdin, tty=args.tty)
         ),
@@ -535,6 +543,8 @@ if __name__ == "__main__":
             break
         try:
             output = actions[thing_to_do](output)
+            if output is None:
+                break
         except SingleValueException as e:
             abort(e)
         except:
