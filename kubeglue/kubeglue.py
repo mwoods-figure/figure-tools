@@ -8,11 +8,17 @@ from itertools import tee
 import fnmatch
 import re
 import json as pyjson
+import os
 import sys
 import shlex
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 from subprocess import run, CompletedProcess
+from functools import partial
+
+
+DEBUG = os.environ.get("GLUEDEBUG") == "1"
+POSTGRES_PORT = 5432
 
 
 def todo():
@@ -31,7 +37,9 @@ def require(predicate: bool, message: str):
 
 class SingleValueException(Exception):
     def __init__(self):
-        super().__init__("expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]")
+        super().__init__(
+            "expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]"
+        )
 
 
 @dataclass
@@ -71,6 +79,13 @@ class KObject:
 
     def __str__(self) -> str:
         return self.line
+
+
+def inspect(*args):
+    if DEBUG:
+        for thing in args:
+            print(f"inspect~{type(thing).__name__}::{thing}".replace("\n", "\\n"))
+    return args[-1]
 
 
 def display(*args, index=None, json=False):
@@ -153,6 +168,7 @@ def singleton_only(thing):
         return next(it, second_end) != second_end
 
     if callable(thing):
+
         @functools.wraps(thing)
         def f(x):
             if iterable(x):
@@ -163,6 +179,7 @@ def singleton_only(thing):
                 return None if len(xs) == 0 else thing(head(xs))
             else:
                 return thing(x)
+
         return f
     elif iterable(thing):
         xs = list(thing)
@@ -309,7 +326,9 @@ def parse_portspec(portspec: str) -> Tuple[Optional[int], int]:
             return (int(ps), int(ps))
 
 
-def port_forward(kobj: KObject, host_port: Optional[int], pod_port: int) -> CompletedProcess:
+def port_forward(
+    kobj: KObject, host_port: Optional[int], pod_port: int
+) -> CompletedProcess:
     specifier = f"{kobj.type_}/{kobj.name}"
     with_host_port = "" if host_port is None else host_port
     with_pod_port = pod_port
@@ -380,15 +399,12 @@ if __name__ == "__main__":
         "--notty", action="store_false", default=True, dest="tty", help="Disable TTY"
     )
     parser.add_argument(
-        "-q",
-        "--quiet",
+        "-v",
+        "--verbose",
         action="store_true",
         default=False,
-        dest="quiet",
-        help="Suppress extra output",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", default=False, dest="verbose"
+        dest="verbose",
+        help="Include more output",
     )
 
     # Supports -1 to -99
@@ -417,7 +433,11 @@ if __name__ == "__main__":
                 ],
             ),
             NV("pods", "List pods"),
-            NV("exec", "Run something", [("command", dict(nargs=argparse.REMAINDER, help="Command to run"))]),
+            NV(
+                "exec",
+                "Run something",
+                [("command", dict(nargs=argparse.REMAINDER, help="Command to run"))],
+            ),
             NV("env", "Print envvars"),
             NV(
                 "port-forward",
@@ -430,7 +450,20 @@ if __name__ == "__main__":
                 ],
             ),
             NV("shell", "Spawn a shell"),
-            NV("psql", "Open psql"),
+            NV(
+                "psql",
+                "Open psql",
+                [
+                    (
+                        "--forward",
+                        dict(
+                            type=int,
+                            metavar="PORT",
+                            help="Port-forward instead of opening a shell",
+                        ),
+                    )
+                ],
+            ),
             NV("pg-dump-schema", "Dump the schema of a Postgres database"),
         ]
         for v in verbs:
@@ -495,30 +528,38 @@ if __name__ == "__main__":
         print(args)
 
     actions = {
-        "pods": lambda last: grep_pods(args.pattern, last),
+        "pods": lambda last: grep_pods(args.pattern, inspect(last)),
         "deployments": lambda _: grep_deployments(args.pattern),
-        "containers": singleton_only(lambda last: containers(last)),
-        "cp": singleton_only(lambda last: copy(last, args.src, args.dest)),
+        "containers": singleton_only(lambda last: containers(inspect(last))),
+        "cp": singleton_only(lambda last: copy(inspect(last), args.src, args.dest)),
         "exec": singleton_only(
             lambda last: exec(
-                last, tokenize(args.command), stdin=args.stdin, tty=args.tty
+                inspect(last), tokenize(args.command), stdin=args.stdin, tty=args.tty
             )
         ),
-        "describe": singleton_only(lambda last: describe(last)),
+        "describe": singleton_only(lambda last: describe(inspect(last))),
         "env": singleton_only(
-            lambda last: exec(last, tokenize("env"), stdin=args.stdin, tty=args.tty)
+            lambda last: exec(
+                inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
+            )
         ),
         "port-forward": singleton_only(
-            lambda last: port_forward(last, *parse_portspec(args.portspec))
+            lambda last: port_forward(inspect(last), *parse_portspec(args.portspec))
         ),
         "shell": singleton_only(
-            lambda last: exec(last, tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty)
+            lambda last: exec(
+                inspect(last), tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty
+            )
         ),
         "psql": singleton_only(
-            lambda last: exec(
-                last,
+            lambda last: port_forward(
+                inspect(last), *parse_portspec(f"{args.forward}:{POSTGRES_PORT}")
+            )
+            if args.forward is not None
+            else exec(
+                inspect(args, last),
                 lambda env: ["psql"]
-                + (["--quiet", "-t"] if args.quiet else [])
+                + (["--quiet", "-t"] if not args.verbose else [])
                 + ["-U", find_postgres_user(env)],
                 stdin=args.stdin,
                 tty=args.tty,
@@ -527,7 +568,7 @@ if __name__ == "__main__":
         ),
         "pg-dump-schema": singleton_only(
             lambda last: exec(
-                last,
+                inspect(last),
                 lambda env: tokenize(f"pg_dump -s -U {find_postgres_user(env)}"),
                 stdin=args.stdin,
                 tty=args.tty,
@@ -557,11 +598,10 @@ if __name__ == "__main__":
             index = None
 
     if output is not None:
-        if not args.quiet:
-            if iterable(output):
-                display(*output, json=args.json)
-            else:
-                display(output, json=args.json)
+        if iterable(output):
+            display(*output, json=args.json)
+        else:
+            display(output, json=args.json)
     else:
         code = 1
 
