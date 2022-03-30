@@ -19,6 +19,24 @@ from functools import partial
 
 DEBUG = os.environ.get("GLUEDEBUG") == "1"
 POSTGRES_PORT = 5432
+PORT_FORWARD_SCRIPT = """
+#!/usr/bin/env bash
+
+# Adapted from https://github.com/kubernetes/kubernetes/issues/72597#issuecomment-693149447
+
+set -e
+
+function cleanup {{
+  echo "Cleaning up {temp_pod_name}"
+  kubectl {namespace_arg} delete pod/{temp_pod_name} --grace-period 1 --wait=false
+}}
+
+trap cleanup EXIT
+
+kubectl run {namespace_arg} --restart=Never --image=alpine/socat {temp_pod_name} -- -d -d tcp-listen:{remote_port},fork,reuseaddr tcp-connect:{remote_host}:{remote_port}
+kubectl wait {namespace_arg} --for=condition=Ready pod/{temp_pod_name}
+kubectl port-forward {namespace_arg} pod/{temp_pod_name} {local_port}:{remote_port}
+"""
 
 
 def todo():
@@ -40,6 +58,29 @@ class SingleValueException(Exception):
         super().__init__(
             "expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]"
         )
+
+@dataclass
+class PortForward:
+    host_port: int
+    port_port: Optional[int] = None
+    remote_ip: Optional[str] = None
+
+    @classmethod
+    def parse_port_forward_spec(cls, portspec: str) -> "PortForward":
+        """
+        "8888:9999"           :: PortForward(host_port=8888, pod_port=9999, remote_ip=None)
+        "8888:192.0.0.1:9999" :: PortForward(host_port=8888, pod_port=9999, remote_ip="192.0.0.1")
+        ":9999"               :: PortForward(host_port=*random*, pod_port:9999, remote_ip=None)
+        "9999"                :: PortForward(host_port=9999, pod_port=9999, remote_ip=None)
+        """
+        ps = portspec.strip()
+        if ps.startswith(":"):
+            return (None, int(ps.lstrip(":")))
+        else:
+            if ":" in ps:
+                return tuple(map(int, ps.split(":")))
+            else:
+                return (int(ps), int(ps))
 
 
 @dataclass
@@ -310,20 +351,6 @@ def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
         return proc
 
 
-def parse_portspec(portspec: str) -> Tuple[Optional[int], int]:
-    """
-    "8888:9999" :: [host-port:8888, pod-port:9999]
-    ":9999"     :: [*random*, pod-port:9999] (k8s chooses a random host port)
-    "9999"      :: [host-port:9999, pod-port:9999]
-    """
-    ps = portspec.strip()
-    if ps.startswith(":"):
-        return (None, int(ps.lstrip(":")))
-    else:
-        if ":" in ps:
-            return tuple(map(int, ps.split(":")))
-        else:
-            return (int(ps), int(ps))
 
 
 def port_forward(
@@ -544,7 +571,7 @@ if __name__ == "__main__":
             )
         ),
         "port-forward": singleton_only(
-            lambda last: port_forward(inspect(last), *parse_portspec(args.portspec))
+            lambda last: port_forward(inspect(last), *parse_port_forward_spec(args.portspec))
         ),
         "shell": singleton_only(
             lambda last: exec(
@@ -553,7 +580,7 @@ if __name__ == "__main__":
         ),
         "psql": singleton_only(
             lambda last: port_forward(
-                inspect(last), *parse_portspec(f"{args.forward}:{POSTGRES_PORT}")
+                inspect(last), *parse_port_forward_spec(f"{args.forward}:{POSTGRES_PORT}")
             )
             if args.forward is not None
             else exec(
