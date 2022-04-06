@@ -4,7 +4,7 @@ import argparse
 import functools
 from contextlib import contextmanager
 from collections.abc import Iterable
-from itertools import tee
+from itertools import chain, tee
 import fnmatch
 import re
 import json as pyjson
@@ -15,9 +15,12 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 from subprocess import run, CompletedProcess
 from functools import partial
+import logging
 
 
+log = logging.getLogger("glue")
 DEBUG = os.environ.get("GLUEDEBUG") == "1"
+
 POSTGRES_PORT = 5432
 PORT_FORWARD_SCRIPT = """
 #!/usr/bin/env bash
@@ -180,23 +183,31 @@ def lines(buffer: bytes) -> Iterator[str]:
         yield line.strip()
 
 
+def flatten(list_of_lists):
+    return chain.from_iterable(list_of_lists)
+
+
 def tokenize(command: Union[str, Iterator[str]]) -> Iterator[str]:
-    if iterable(command):
-        return command
-    return shlex.split(command)
+    return list(
+        flatten(
+            shlex.split(token)
+            for token in (command if iterable(command) else shlex.split(command))
+        )
+    )
 
 
 @contextmanager
 def kubectl(*args, **kwargs):
-    cp = command("kubectl", *args, **kwargs)
+    proc = command("kubectl", *args, **kwargs)
+    log.info(f"RUN >> kubectl {' '.join(args)} * {kwargs}")
     capture = kwargs.get("capture")
     if capture:
-        if cp.stdout is not None:
-            yield lines(cp.stdout)
+        if proc.stdout is not None:
+            yield lines(proc.stdout)
         else:
             yield None
     else:
-        yield cp
+        yield proc
 
 
 def iterable(thing) -> bool:
@@ -420,6 +431,8 @@ def exec(
     with_stdin = ["--stdin"] if stdin else []
     with_tty = ["--tty"] if tty else []
     with_command = command(env) if callable(command) else command
+    if with_command[0] != "--":
+        with_command.insert(0, "--")
 
     with kubectl(
         "exec",
@@ -429,8 +442,18 @@ def exec(
         kobj.namespace,
         kobj.to_specifier(),
         *with_container,
-        "--",
         *with_command,
+    ) as proc:
+        return proc
+
+
+def logs(kobj: KObject, rest=[]) -> CompletedProcess:
+
+    container = primary_container(kobj)
+    with_container = ["-c", container] if container else []
+
+    with kubectl(
+        "logs", "-n", kobj.namespace, kobj.to_specifier(), *with_container, *rest
     ) as proc:
         return proc
 
@@ -484,12 +507,9 @@ if __name__ == "__main__":
                 ],
             ),
             NV("pods", "List pods"),
-            NV(
-                "exec",
-                "Run something",
-                [("command", dict(nargs=argparse.REMAINDER, help="Command to run"))],
-            ),
+            NV("exec", "Run something"),
             NV("env", "Print envvars"),
+            NV("logs", "View logs"),
             NV(
                 "port-forward",
                 "Port forward",
@@ -521,6 +541,12 @@ if __name__ == "__main__":
             pp = p.add_parser(v.name, help=f"Verb: {v.description}")
             for name, kws in v.arguments:
                 pp.add_argument(name, **kws)
+            pp.add_argument(
+                "rest",
+                nargs=argparse.REMAINDER,
+                help="Unconsumed arguments in `rest` will be passed to kubectl",
+            )
+
             # build_index_args(pp)
 
     def build_nouns(parser):
@@ -563,7 +589,10 @@ if __name__ == "__main__":
     build_index_args(parser)
     build_nouns(parser)
 
-    args = parser.parse_args()
+    args, remaining = parser.parse_known_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 
     do_next = []
     if (noun := getattr(args, "noun", None)) is not None:
@@ -576,7 +605,8 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.verbose:
-        print(args)
+        log.info(args)
+        log.info(remaining)
 
     actions = {
         "pods": lambda last: grep_pods(args.pattern, inspect(last)),
@@ -585,7 +615,10 @@ if __name__ == "__main__":
         "cp": singleton_only(lambda last: copy(inspect(last), args.src, args.dest)),
         "exec": singleton_only(
             lambda last: exec(
-                inspect(last), tokenize(args.command), stdin=args.stdin, tty=args.tty
+                inspect(last),
+                tokenize(args.rest) + tokenize(remaining),
+                stdin=args.stdin,
+                tty=args.tty,
             )
         ),
         "describe": singleton_only(lambda last: describe(inspect(last))),
@@ -593,6 +626,9 @@ if __name__ == "__main__":
             lambda last: exec(
                 inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
             )
+        ),
+        "logs": singleton_only(
+            lambda last: logs(inspect(last), tokenize(args.rest) + tokenize(remaining))
         ),
         "port-forward": singleton_only(
             lambda last: port_forward(inspect(last), PortForward.parse(args.portspec))
@@ -649,10 +685,14 @@ if __name__ == "__main__":
             index = None
 
     if output is not None:
-        if iterable(output):
-            display(*output, json=args.json)
+        if isinstance(output, CompletedProcess):
+            if args.verbose:
+                log.info(output)
         else:
-            display(output, json=args.json)
+            if iterable(output):
+                display(*output, json=args.json)
+            else:
+                display(output, json=args.json)
     else:
         code = 1
 
