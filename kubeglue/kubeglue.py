@@ -59,28 +59,50 @@ class SingleValueException(Exception):
             "expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]"
         )
 
+
 @dataclass
 class PortForward:
-    host_port: int
-    port_port: Optional[int] = None
-    remote_ip: Optional[str] = None
+    host_port: Optional[int]
+    pod_port: int
+    remote_ip: Optional[str]
+
+    @property
+    def has_remote_ip(self) -> bool:
+        return self.remote_ip is not None
+
+    def to_specifier(self) -> str:
+        return f"{self.host_port or ''}:{self.pod_port}"
 
     @classmethod
-    def parse_port_forward_spec(cls, portspec: str) -> "PortForward":
+    def parse(cls, portspec: str) -> "PortForward":
         """
-        "8888:9999"           :: PortForward(host_port=8888, pod_port=9999, remote_ip=None)
-        "8888:192.0.0.1:9999" :: PortForward(host_port=8888, pod_port=9999, remote_ip="192.0.0.1")
-        ":9999"               :: PortForward(host_port=*random*, pod_port:9999, remote_ip=None)
-        "9999"                :: PortForward(host_port=9999, pod_port=9999, remote_ip=None)
+        Specifiers:
+          "8888:9999"           :: PortForward(host_port=8888, pod_port=9999, remote_ip=None)
+          ":192.0.0.1:9999"     :: PortForward(host_port=*random*, pod_port=9999, remote_ip="192.0.0.1")
+          "8888:192.0.0.1:9999" :: PortForward(host_port=8888, pod_port=9999, remote_ip="192.0.0.1")
+          ":9999"               :: PortForward(host_port=*random*, pod_port:9999, remote_ip=None)
+          "9999"                :: PortForward(host_port=9999, pod_port=9999, remote_ip=None)
         """
         ps = portspec.strip()
-        if ps.startswith(":"):
-            return (None, int(ps.lstrip(":")))
-        else:
-            if ":" in ps:
-                return tuple(map(int, ps.split(":")))
-            else:
-                return (int(ps), int(ps))
+        colons = ps.count(":")
+        if colons == 2:
+            (host, remote, pod) = ps.split(":")
+            return PortForward(
+                host_port=None if host.strip() == "" else int(host),
+                pod_port=int(pod),
+                remote_ip=remote,
+            )
+        elif colons == 1:
+            (host, pod) = ps.split(":")
+            return PortForward(
+                host_port=None if host.strip() == "" else int(host),
+                pod_port=int(pod),
+                remote_ip=None,
+            )
+        elif colons == 0:
+            port = int(ps)
+            return PortForward(host_port=port, pod_port=port, remote_ip=None)
+        raise ValueError(f"Malform port spec: {portspec}")
 
 
 @dataclass
@@ -104,6 +126,9 @@ class KObject:
     @property
     def is_deployment(self) -> bool:
         return self.type_ == "deployment"
+
+    def to_specifier(self) -> str:
+        return f"{self.type_}/{self.name}"
 
     def to_json(self) -> str:
         return pyjson.dumps(self.attributes)
@@ -351,22 +376,21 @@ def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
         return proc
 
 
-
-
-def port_forward(
-    kobj: KObject, host_port: Optional[int], pod_port: int
-) -> CompletedProcess:
-    specifier = f"{kobj.type_}/{kobj.name}"
-    with_host_port = "" if host_port is None else host_port
-    with_pod_port = pod_port
-    with kubectl(
-        "port-forward",
-        "-n",
-        kobj.namespace,
-        specifier,
-        f"{with_host_port}:{with_pod_port}",
-    ) as proc:
-        return proc
+def port_forward(kobj: KObject, fwd_spec: PortForward) -> CompletedProcess:
+    if fwd_spec.has_remote_ip:
+        raise NotImplementedError(
+            "Port forwarding with remote IP is not a pod or deployment operation.\n"
+            + "Try kube glue port-forward <port-spec>"
+        )
+    else:
+        with kubectl(
+            "port-forward",
+            "-n",
+            kobj.namespace,
+            kobj.to_specifier(),
+            fwd_spec.to_specifier(),
+        ) as proc:
+            return proc
 
 
 def exec(
@@ -381,7 +405,7 @@ def exec(
             "exec",
             "-n",
             kobj.namespace,
-            f"{kobj.type_}/{kobj.name}",
+            kobj.to_specifier(),
             *with_container,
             "--",
             "env",
@@ -403,7 +427,7 @@ def exec(
         *with_tty,
         "-n",
         kobj.namespace,
-        f"{kobj.type_}/{kobj.name}",
+        kobj.to_specifier(),
         *with_container,
         "--",
         *with_command,
@@ -571,7 +595,7 @@ if __name__ == "__main__":
             )
         ),
         "port-forward": singleton_only(
-            lambda last: port_forward(inspect(last), *parse_port_forward_spec(args.portspec))
+            lambda last: port_forward(inspect(last), PortForward.parse(args.portspec))
         ),
         "shell": singleton_only(
             lambda last: exec(
@@ -580,7 +604,7 @@ if __name__ == "__main__":
         ),
         "psql": singleton_only(
             lambda last: port_forward(
-                inspect(last), *parse_port_forward_spec(f"{args.forward}:{POSTGRES_PORT}")
+                inspect(last), PortForward.parse(f"{args.forward}:{POSTGRES_PORT}")
             )
             if args.forward is not None
             else exec(
