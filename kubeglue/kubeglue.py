@@ -1,93 +1,31 @@
 #!/usr/bin/env python
 
+import asyncio
 import argparse
 import functools
+from copy import deepcopy
 from contextlib import contextmanager
 from collections.abc import Iterable
-from itertools import tee
+from itertools import chain, tee
 import fnmatch
 import re
 import json as pyjson
 import os
 import sys
 import shlex
+import json
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple, Union
-from subprocess import run, CompletedProcess
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from subprocess import Popen, PIPE, STDOUT
 from functools import partial
+from io import TextIOWrapper
+import logging
+import sys
+import inspect
+import pprint
 
 
-DEBUG = os.environ.get("GLUEDEBUG") == "1"
-POSTGRES_PORT = 5432
-PORT_FORWARD_SCRIPT = """
-#!/usr/bin/env bash
-
-# Adapted from https://github.com/kubernetes/kubernetes/issues/72597#issuecomment-693149447
-
-set -e
-
-function cleanup {{
-  echo "Cleaning up {temp_pod_name}"
-  kubectl {namespace_arg} delete pod/{temp_pod_name} --grace-period 1 --wait=false
-}}
-
-trap cleanup EXIT
-
-kubectl run {namespace_arg} --restart=Never --image=alpine/socat {temp_pod_name} -- -d -d tcp-listen:{remote_port},fork,reuseaddr tcp-connect:{remote_host}:{remote_port}
-kubectl wait {namespace_arg} --for=condition=Ready pod/{temp_pod_name}
-kubectl port-forward {namespace_arg} pod/{temp_pod_name} {local_port}:{remote_port}
-"""
-
-
-def todo():
-    raise NotImplementedError
-
-
-def abort(message: str):
-    print(f"error: {message}")
-    sys.exit(1)
-
-
-def require(predicate: bool, message: str):
-    if not predicate:
-        abort(message)
-
-
-class SingleValueException(Exception):
-    def __init__(self):
-        super().__init__(
-            "expected single value but got multiple values [hint: use an index arg like -1, -2, -3, etc.]"
-        )
-
-@dataclass
-class PortForward:
-    host_port: int
-    port_port: Optional[int] = None
-    remote_ip: Optional[str] = None
-
-    @classmethod
-    def parse_port_forward_spec(cls, portspec: str) -> "PortForward":
-        """
-        "8888:9999"           :: PortForward(host_port=8888, pod_port=9999, remote_ip=None)
-        "8888:192.0.0.1:9999" :: PortForward(host_port=8888, pod_port=9999, remote_ip="192.0.0.1")
-        ":9999"               :: PortForward(host_port=*random*, pod_port:9999, remote_ip=None)
-        "9999"                :: PortForward(host_port=9999, pod_port=9999, remote_ip=None)
-        """
-        ps = portspec.strip()
-        if ps.startswith(":"):
-            return (None, int(ps.lstrip(":")))
-        else:
-            if ":" in ps:
-                return tuple(map(int, ps.split(":")))
-            else:
-                return (int(ps), int(ps))
-
-
-@dataclass
-class NV:
-    name: str
-    description: str
-    arguments: List[Tuple[str, Dict[str, str]]] = field(default_factory=list)
+log = logging.getLogger("glue")
 
 
 @dataclass(repr=False)
@@ -97,6 +35,14 @@ class KObject:
     headers: List[str]
     attributes: Dict[str, str] = field(init=False)
 
+    @classmethod
+    def pod(cls, line, headers):
+        return cls(line, "pod", headers)
+
+    @classmethod
+    def deployment(cls, line, headers):
+        return cls(line, "deployment", headers)
+
     @property
     def is_pod(self) -> bool:
         return self.type_ == "pod"
@@ -105,12 +51,18 @@ class KObject:
     def is_deployment(self) -> bool:
         return self.type_ == "deployment"
 
+    def to_specifier(self) -> str:
+        return f"{self.type_}/{self.name}"
+
     def to_json(self) -> str:
         return pyjson.dumps(self.attributes)
 
     def __post_init__(self):
         values = columns(self.line)
         self.attributes = dict(zip(self.headers, values))
+
+    def __getitem__(self, key):
+        return self.attributes[key]
 
     def __getattr__(self, name):
         return self.attributes[name]
@@ -122,56 +74,43 @@ class KObject:
         return self.line
 
 
-def inspect(*args):
-    if DEBUG:
-        for thing in args:
-            print(f"inspect~{type(thing).__name__}::{thing}".replace("\n", "\\n"))
-    return args[-1]
+@contextmanager
+def kubectl(*args, **kwargs):
+    stdout = kwargs.pop("stdout") if "stdout" in kwargs else PIPE
+    log.warning(f"!EXECUTE: kubectl {' '.join(args)}")
+    with Popen(["kubectl", *args], stdout=stdout, **kwargs) as proc:
+        yield proc
 
 
-def display(*args, index=None, json=False):
-    def is_primitive(thing) -> bool:
-        return isinstance(thing, (type(None), bool, float, int, str))
-
-    def prepare(thing, json: bool = False) -> str:
-        if json:
-            return pyjson.dumps(thing) if is_primitive(thing) else thing.to_json()
-        else:
-            return thing if is_primitive(thing) else repr(thing)
-
-    if len(args) == 1:
-        print(prepare(args[0], json=json))
-    else:
-        for i, kobj in enumerate(args, start=1):
-            print(f"[{i:>2}] {prepare(kobj, json=json)}")
+def error(message):
+    raise Exception(message)
 
 
-def command(*args, capture: bool = False) -> CompletedProcess:
-    return run(args, check=True, capture_output=capture)
-
-
-def lines(buffer: bytes) -> Iterator[str]:
-    for line in buffer.decode("utf-8").split("\n"):
-        yield line.strip()
-
-
-def tokenize(command: Union[str, Iterator[str]]) -> Iterator[str]:
-    if iterable(command):
-        return command
-    return shlex.split(command)
+def cond_arg(test, *args, default=[]):
+    return args if test else default
 
 
 @contextmanager
-def kubectl(*args, **kwargs):
-    cp = command("kubectl", *args, **kwargs)
-    capture = kwargs.get("capture")
-    if capture:
-        if cp.stdout is not None:
-            yield lines(cp.stdout)
-        else:
-            yield None
-    else:
-        yield cp
+def fzf(pipe_in, *args, query=None, **kwargs):
+    text = kwargs.pop("text") if "text" in kwargs else True
+    with_query = cond_arg(query, "--query", query)
+    with Popen(
+        [
+            "fzf",
+            "--cycle",
+            "--multi",
+            "--layout=reverse-list",
+            "--tac",
+            "--height=~50%",
+            *with_query,
+            *args,
+        ],
+        stdin=pipe_in,
+        stdout=PIPE,
+        text=text,
+        **kwargs,
+    ) as proc:
+        yield proc
 
 
 def iterable(thing) -> bool:
@@ -186,7 +125,7 @@ def iterable(thing) -> bool:
         return False
 
 
-def head(thing):
+def first(thing):
     if iterable(thing):
         return next(iter(thing), None)
     return thing
@@ -199,36 +138,41 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
     return None
 
 
-def singleton_only(thing):
-    def has_second(g):
-        it = iter(g)
-        first_end, second_end = object(), object()
-        first = next(it, first_end)
-        if first == first_end:
-            return False
-        return next(it, second_end) != second_end
-
-    if callable(thing):
-
-        @functools.wraps(thing)
-        def f(x):
-            if iterable(x):
-                xs = list(x)
-                if has_second(xs):
-                    raise SingleValueException
-                # If nothing left, return None to stop
-                return None if len(xs) == 0 else thing(head(xs))
-            else:
-                return thing(x)
-
-        return f
+def lines(thing: Union[bytes, Iterable[str]]) -> Iterator[str]:
+    if isinstance(thing, bytes):
+        for line in thing.decode("utf-8").split("\n"):
+            yield line.strip()
     elif iterable(thing):
-        xs = list(thing)
-        if has_second(xs):
-            raise SingleValueException
-        return head(xs)
-    # already a scalar:
-    return thing
+        for line in thing:
+            yield line
+    else:
+        return iter([thing])
+
+
+def unlines(pieces: Iterable[Union[str, bytes]]) -> str:
+    return "\n".join(
+        piece.decode("utf-8") if isinstance(piece, bytes) else piece for piece in pieces
+    )
+
+
+def menu(*items: str) -> str:
+    with fzf(PIPE) as p:
+        out, err = p.communicate(unlines(reversed(items)))
+        if err:
+            raise ValueError(err)
+        return out.strip()
+
+
+def pretty_json(thing):
+    if isinstance(thing, str):
+        out = json.loads(thing)
+    else:
+        out = thing
+    print(json.dumps(out, indent=4))
+
+
+# def flatten(list_of_lists):
+#     return chain.from_iterable(list_of_lists)
 
 
 def find_postgres_user(env: Dict[str, str]) -> str:
@@ -239,397 +183,331 @@ def find_postgres_user(env: Dict[str, str]) -> str:
     raise Exception("env:no postgres user found")
 
 
-def columns(line: str) -> List[str]:
-    return line.split()
+def columns(line: str) -> Iterable[str]:
+    for column in line.split():
+        yield column
 
 
-def get_pods(selector: Optional[str] = None) -> Iterator[KObject]:
-    headers = ["namespace", "name", "ready", "status", "restarts", "age"]
-    with_selector = [f"--selector={selector}"] if selector is not None else []
-    with kubectl(
-        "get", "pods", "-A", "--no-headers=true", *with_selector, capture=True
-    ) as lines:
-        return (
-            KObject(line, "pod", headers) for line in lines if len(line.strip()) > 0
-        )
-
-
-def get_deployments() -> Iterator[KObject]:
+async def choose_pods(
+    namespace: Optional[str] = None, selector: Optional[str] = None
+) -> Iterator[KObject]:
+    """
+    List and choose pods.
+    """
     headers = [
         "namespace",
         "name",
-        "ready",
-        "up-to-date",
-        "available",
-        "age",
-        "containers",
-        "images",
-        "selector",
+        "container-images",
     ]
+
+    custom_headers = """custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,CONTAINER-IMAGES:.spec.containers[*].image"""
+
     with kubectl(
-        "get", "deployments", "-A", "--no-headers=true", "-o", "wide", capture=True
-    ) as lines:
-        return (
-            KObject(line, "deployment", headers)
-            for line in lines
-            if len(line.strip()) > 0
-        )
+        "get",
+        "pods",
+        *cond_arg(namespace, "-n", namespace, default=["-A"]),
+        "--no-headers=true",
+        *["-o", custom_headers],
+        *cond_arg(selector, f"--selector={selector}"),
+        text=True,
+    ) as p1:
+        with fzf(p1.stdout) as p2:
+            return iter([KObject.pod(line, headers) for line in p2.stdout])
 
 
-def grep_objects(
-    pattern: str, kobjs: Iterator[KObject], transform=lambda o: o.line
-) -> Iterator[KObject]:
-    # it's useful to prepend+append "*" to the pattern if they're not there because
-    # this usually the intention:
-    p = pattern.strip()
-    if not p.startswith("*"):
-        p = "*" + p
-    if not p.endswith("*"):
-        p += "*"
-    regex = re.compile(fnmatch.translate(p), re.I)
-    return (o for o in kobjs if re.search(regex, transform(o)))
+async def choose_deployments(namespace: Optional[str] = None) -> Iterator[KObject]:
+    """
+    List and choose deployments.
+    """
+    headers = [
+        "namespace",
+        "name",
+    ]
+
+    custom_headers = (
+        """custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name"""
+    )
+
+    with kubectl(
+        "get",
+        "deployments",
+        *cond_arg(namespace, "-n", namespace, default=["-A"]),
+        "--no-headers=true",
+        *["-o", custom_headers],
+        text=True,
+    ) as p1:
+        with fzf(p1.stdout) as p2:
+            return iter([KObject.deployment(line, headers) for line in p2.stdout])
 
 
-def grep_pods(
-    pattern: Union[str, KObject], kobj: Optional[KObject] = None
-) -> Iterator[KObject]:
-    if kobj is not None:
-        require(kobj.is_deployment, "deployment object expected")
-        pods = get_pods(kobj.selector)
-    else:
-        pods = get_pods()
-    return grep_objects(pattern, pods)
-
-
-def grep_deployments(pattern: str) -> Iterator[KObject]:
-    return grep_objects(pattern, get_deployments())
-
-
-def describe(kobj: KObject) -> Iterator[str]:
-    return (f"{key}: {value}" for key, value in kobj.attributes.items())
-
-
-def containers(kobj: KObject) -> Iterator[str]:
+async def choose_containers(kobj: KObject) -> Iterator[str]:
+    """
+    Given a [KObject], list containers and choose one.
+    """
     if kobj.is_pod:
         jsonpath = "jsonpath={.spec.containers[*].name}"
     elif kobj.is_deployment:
         jsonpath = "jsonpath={.spec.template.spec.containers[*].name}"
     else:
-        todo()
+        return iter([])
     with kubectl(
-        "get", "-n", kobj.namespace, kobj.type_, kobj.name, "-o", jsonpath, capture=True
-    ) as lines:
-        return columns(head(lines))
+        "get", "-n", kobj.namespace, kobj.type_, kobj.name, "-o", jsonpath
+    ) as p1:
+        containers = unlines(columns(first(p1.stdout)))
+        with fzf(PIPE) as p2:
+            containers_line, err = p2.communicate(containers)
+            if err is not None:
+                error(err)
+            return iter(c.strip() for c in containers_line.split("\n"))
 
 
-def primary_container(kobj: KObject) -> Optional[str]:
-    skip = {"linkerd", "linkerd-proxy"}
-    return head([c for c in containers(kobj) if c not in skip])
+async def command_exec(args, remaining, kobj=None, container=None, stdout=None, f=None):
+    """
+    Execute a command on a pod.
+    """
+    namespace = args.get("namespace")
+    selector = args.get("selector")
+    tty = (args.get("tty"),)
+    if not kobj:
+        pods = await choose_pods(namespace, selector)
+        kobj = first(pods)
+    if not container:
+        containers = await choose_containers(kobj)
+        container = first(containers)
 
-
-def primary_pod(kobj: KObject) -> KObject:
-    if kobj.is_pod:
-        return kobj
-    else:
-        # assumed to be a deployment:
-        return singleton_only(get_pods(kobj.selector))
-
-
-def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
-    container = primary_container(kobj)
-    with_container = ["-c", container] if container else []
-
-    pod = primary_pod(kobj)
-
-    with kubectl(
-        "cp",
-        src,
-        f"{kobj.namespace}/{pod}:{dest}",
-        *with_container,
-        capture=False,
-    ) as proc:
-        return proc
-
-
-
-
-def port_forward(
-    kobj: KObject, host_port: Optional[int], pod_port: int
-) -> CompletedProcess:
-    specifier = f"{kobj.type_}/{kobj.name}"
-    with_host_port = "" if host_port is None else host_port
-    with_pod_port = pod_port
-    with kubectl(
-        "port-forward",
-        "-n",
-        kobj.namespace,
-        specifier,
-        f"{with_host_port}:{with_pod_port}",
-    ) as proc:
-        return proc
-
-
-def exec(
-    kobj: KObject, command, stdin: bool = True, tty: bool = True, host_env: bool = False
-):
-    container = primary_container(kobj)
-    with_container = ["-c", container] if container else []
-
-    env = {}
-    if host_env:
-        with kubectl(
-            "exec",
-            "-n",
-            kobj.namespace,
-            f"{kobj.type_}/{kobj.name}",
-            *with_container,
-            "--",
-            "env",
-            capture=True,
-        ) as lines:
-            for line in lines:
-                parts = line.split("=")
-                key = parts[0]
-                value = parts[1] if len(parts) > 1 else ""
-                env[key.strip()] = value.strip()
-
-    with_stdin = ["--stdin"] if stdin else []
-    with_tty = ["--tty"] if tty else []
-    with_command = command(env) if callable(command) else command
+    cmd = args.get("cmd")
+    cmd_tokens = cmd if iterable(cmd) else shlex.split(cmd)
 
     with kubectl(
         "exec",
-        *with_stdin,
-        *with_tty,
+        *cond_arg(args.get("stdin"), "--stdin"),
+        *cond_arg(tty, "--tty"),
+        *["-n", kobj.namespace],
+        kobj.to_specifier(),
+        *["-c", container],
+        "--",
+        *cmd_tokens,
+        stdout=stdout,
+        text=tty,
+    ) as p:
+        if callable(f):
+            return f(p)
+        else:
+            return None
+
+
+async def command_env(args, remaining, kobj=None, container=None, quiet=False):
+    """
+    Print environment variables
+    """
+    args["cmd"] = "/bin/env"
+
+    def collect(proc):
+        e = {}
+        for line in lines(proc.stdout):
+            line = line.strip()
+            parts = line.split("=")
+            e[parts[0]] = parts[1]
+        return e
+
+    e = await command_exec(
+        args, remaining, kobj=kobj, container=container, stdout=PIPE, f=collect
+    )
+
+    if not quiet:
+        if args.get("json"):
+            pretty_json(e)
+        else:
+            pprint.pprint(e)
+
+    return e
+
+
+async def command_shell(args, remaining, kobj=None, container=None):
+    """
+    Execute a shell.
+    """
+    args["cmd"] = "/bin/bash"
+    args["stdin"] = True
+    args["tty"] = True
+    await command_exec(args, remaining, kobj=kobj, container=container)
+
+
+async def command_logs(args, remaining):
+    """
+    Stream kubectl logs.
+    """
+    namespace = args.get("namespace")
+    selector = args.get("selector")
+    tail = args.get("tail", False)
+    choice = menu("pod", "deployment")
+    if choice == "pod":
+        chosen = await choose_pods(namespace, selector)
+    elif choice == "deployment":
+        chosen = await choose_deployments(namespace)
+    else:
+        raise NotImplementedError
+
+    kobj = first(chosen)
+    containers = await choose_containers(kobj)
+    container = first(containers)
+
+    with kubectl(
+        "logs",
         "-n",
         kobj.namespace,
-        f"{kobj.type_}/{kobj.name}",
-        *with_container,
-        "--",
-        *with_command,
-    ) as proc:
-        return proc
+        kobj.to_specifier(),
+        "-f",
+        "-c",
+        container,
+        stdout=PIPE,
+        text=True,
+    ) as p:
+        while True:
+            p.poll()
+            if p.stdout:
+                for line in p.stdout:
+                    try:
+                        pretty_json(line.strip())
+                    except Exception as e:
+                        print(line.strip())
+            if not tail:
+                break
+        if p.stdout:
+            p.stdout.close()
+
+
+async def command_db(args, remaining):
+    """
+    Connect to a Figure database and open a psql prompt.
+    """
+    namespace = args.get("namespace")
+    selector = args.get("selector")
+    tail = args.get("tail", False)
+    choice = menu("pod", "deployment")
+    if choice == "pod":
+        chosen = await choose_pods(namespace, selector)
+    elif choice == "deployment":
+        chosen = await choose_deployments(namespace)
+    else:
+        raise NotImplementedError
+
+    kobj = first(chosen)
+    containers = await choose_containers(kobj)
+    container = first(containers)
+
+    env = await command_env(args, remaining, kobj=kobj, container=container, quiet=True)
+    db_user = find_postgres_user(env)
+
+    args["cmd"] = f"""/usr/bin/psql -U {db_user}"""
+    args["stdin"] = True
+    args["tty"] = True
+
+    await command_exec(args, remaining, kobj=kobj, container=container)
+
+
+def setup_args() -> Tuple[str, Dict[str, Any], List[str]]:
+    def setup_global_args(parser, suppress=False):
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            action="store_true",
+            default=argparse.SUPPRESS if suppress else False,
+            dest="verbose",
+            help="Include more output",
+        )
+        parser.add_argument(
+            "-n",
+            "--namespace",
+            default=argparse.SUPPRESS if suppress else None,
+            dest="namespace",
+            help="Namespace to use",
+        )
+        return parser
+
+    def setup_db(parser):
+        p = parser.add_parser(
+            "db", description="Connect to a Figure database and open a psql prompt"
+        )
+        setup_global_args(p, suppress=True)
+
+    def setup_env(parser):
+        p = parser.add_parser("env", description="Display environment variables")
+        p.add_argument(
+            "--json", action="store_true", default=True, help="Output as JSON"
+        )
+        setup_global_args(p, suppress=True)
+
+    def setup_exec(parser):
+        p = parser.add_parser("exec", description="Execute a command on a pod")
+        setup_global_args(p, suppress=True)
+        p.add_argument("cmd", help="A command to run")
+        p.add_argument(
+            "-t", "--tty", action="store_true", dest="tty", help="Enable tty"
+        )
+        p.add_argument(
+            "-i", "--stdin", action="store_true", dest="stdin", help="Enable stdin"
+        )
+
+    def setup_logs(parser):
+        p = parser.add_parser("logs", description="Stream kubectl logs")
+        setup_global_args(p, suppress=True)
+        p.add_argument(
+            "-f",
+            "--tail",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            dest="tail",
+            help="Tail output",
+        )
+
+    def setup_shell(parser):
+        p = parser.add_parser("shell", description="Open a shell")
+        setup_global_args(p, suppress=True)
+
+    root_parser = argparse.ArgumentParser()
+    setup_global_args(root_parser)
+    commands = root_parser.add_subparsers(
+        title="Commands", dest="command", required=True
+    )
+
+    setup = [setup_db, setup_env, setup_exec, setup_logs, setup_shell]
+    for f in setup:
+        f(commands)
+
+    args, remaining = root_parser.parse_known_args()
+    args = vars(args)
+
+    return str(args["command"]), args, remaining
+
+
+async def runner(command: str, args: Dict[str, Any], remaining: list[str]):
+
+    verbose = args.get("verbose", False)
+
+    if verbose:
+        logging.basicConfig(level=logging.INFO)
+
+    command_functions = {
+        name: obj
+        for (name, obj) in inspect.getmembers(sys.modules[__name__])
+        if (
+            inspect.isfunction(obj)
+            and name.startswith("command_")
+            and obj.__module__ == __name__
+        )
+    }
+    command_name = f"command_{command}"
+    if command_name not in command_functions:
+        print(f"Invalid command: {command}")
+        sys.exit(1)
+
+    f = command_functions[command_name]
+    await f(args, remaining)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--json", action="store_true", default=False, dest="json")
-    parser.add_argument(
-        "--nostdin",
-        action="store_false",
-        default=True,
-        dest="stdin",
-        help="Disable stdin redirection",
-    )
-    parser.add_argument(
-        "--notty", action="store_false", default=True, dest="tty", help="Disable TTY"
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        default=False,
-        dest="verbose",
-        help="Include more output",
-    )
-
-    # Supports -1 to -99
-    def build_index_args(parser):
-        for i in range(1, 100):
-            parser.add_argument(
-                f"-{i}",
-                action="store_const",
-                const=i,
-                required=False,
-                dest="index",
-                help=argparse.SUPPRESS,
-            )
-
-    def build_verbs(parser):
-        p = parser.add_subparsers(help="verb", dest="verb")
-        verbs = [
-            NV("containers", "Show containers"),
-            NV("describe", "Describe object"),
-            NV(
-                "cp",
-                "Copy files",
-                [
-                    ("src", dict(help="Copy source")),
-                    ("dest", dict(help="Copy destination")),
-                ],
-            ),
-            NV("pods", "List pods"),
-            NV(
-                "exec",
-                "Run something",
-                [("command", dict(nargs=argparse.REMAINDER, help="Command to run"))],
-            ),
-            NV("env", "Print envvars"),
-            NV(
-                "port-forward",
-                "Port forward",
-                [
-                    (
-                        "portspec",
-                        dict(help="Port specifier: either <host>:<pod> or :<pod>"),
-                    )
-                ],
-            ),
-            NV("shell", "Spawn a shell"),
-            NV(
-                "psql",
-                "Open psql",
-                [
-                    (
-                        "--forward",
-                        dict(
-                            type=int,
-                            metavar="PORT",
-                            help="Port-forward instead of opening a shell",
-                        ),
-                    )
-                ],
-            ),
-            NV("pg-dump-schema", "Dump the schema of a Postgres database"),
-        ]
-        for v in verbs:
-            pp = p.add_parser(v.name, help=f"Verb: {v.description}")
-            for name, kws in v.arguments:
-                pp.add_argument(name, **kws)
-            # build_index_args(pp)
-
-    def build_nouns(parser):
-        p = parser.add_subparsers(help="noun", dest="noun")
-        nouns = [
-            NV(
-                "pods",
-                "Pods",
-                [
-                    (
-                        "pattern",
-                        dict(
-                            metavar="glob-pattern",
-                            help="Glob pattern, e.g. 'foo*', 'processor*db*deploy*'",
-                        ),
-                    )
-                ],
-            ),
-            NV(
-                "deployments",
-                "Deployments",
-                [
-                    (
-                        "pattern",
-                        dict(
-                            metavar="glob-pattern",
-                            help="Glob search pattern, e.g 'foo*, processor*db*deploy*'",
-                        ),
-                    )
-                ],
-            ),
-        ]
-        for n in nouns:
-            pp = p.add_parser(n.name, help=f"Noun: {n.description}")
-            build_index_args(pp)
-            for name, kws in n.arguments:
-                pp.add_argument(name, **kws)
-            build_verbs(pp)
-
-    build_index_args(parser)
-    build_nouns(parser)
-
-    args = parser.parse_args()
-
-    do_next = []
-    if (noun := getattr(args, "noun", None)) is not None:
-        do_next.append(noun)
-    if (verb := getattr(args, "verb", None)) is not None:
-        do_next.append(verb)
-
-    if len(do_next) == 0:
-        parser.print_help()
-        sys.exit(0)
-
-    if args.verbose:
-        print(args)
-
-    actions = {
-        "pods": lambda last: grep_pods(args.pattern, inspect(last)),
-        "deployments": lambda _: grep_deployments(args.pattern),
-        "containers": singleton_only(lambda last: containers(inspect(last))),
-        "cp": singleton_only(lambda last: copy(inspect(last), args.src, args.dest)),
-        "exec": singleton_only(
-            lambda last: exec(
-                inspect(last), tokenize(args.command), stdin=args.stdin, tty=args.tty
-            )
-        ),
-        "describe": singleton_only(lambda last: describe(inspect(last))),
-        "env": singleton_only(
-            lambda last: exec(
-                inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
-            )
-        ),
-        "port-forward": singleton_only(
-            lambda last: port_forward(inspect(last), *parse_port_forward_spec(args.portspec))
-        ),
-        "shell": singleton_only(
-            lambda last: exec(
-                inspect(last), tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty
-            )
-        ),
-        "psql": singleton_only(
-            lambda last: port_forward(
-                inspect(last), *parse_port_forward_spec(f"{args.forward}:{POSTGRES_PORT}")
-            )
-            if args.forward is not None
-            else exec(
-                inspect(args, last),
-                lambda env: ["psql"]
-                + (["--quiet", "-t"] if not args.verbose else [])
-                + ["-U", find_postgres_user(env)],
-                stdin=args.stdin,
-                tty=args.tty,
-                host_env=True,
-            )
-        ),
-        "pg-dump-schema": singleton_only(
-            lambda last: exec(
-                inspect(last),
-                lambda env: tokenize(f"pg_dump -s -U {find_postgres_user(env)}"),
-                stdin=args.stdin,
-                tty=args.tty,
-                host_env=True,
-            )
-        ),
-    }
-
-    output, code, index = None, 0, args.index
-
-    while len(do_next) > 0:
-        if (thing_to_do := do_next.pop(0)) is None:
-            break
-        try:
-            output = actions[thing_to_do](output)
-            if output is None:
-                break
-        except SingleValueException as e:
-            abort(e)
-        except:
-            raise
-        if index is not None:
-            if iterable(output):
-                output = take(output, index)
-            else:
-                output = None
-            index = None
-
-    if output is not None:
-        if iterable(output):
-            display(*output, json=args.json)
-        else:
-            display(output, json=args.json)
-    else:
-        code = 1
-
-    sys.exit(code)
+    command, args, remaining = setup_args()
+    asyncio.run(runner(command, args, remaining))
