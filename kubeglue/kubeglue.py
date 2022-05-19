@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import asyncio
 import argparse
 import functools
 from contextlib import contextmanager
@@ -469,8 +470,7 @@ def logs(kobj: KObject, rest=[]) -> CompletedProcess:
         return proc
 
 
-if __name__ == "__main__":
-
+def setup_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true", default=False, dest="json")
     parser.add_argument(
@@ -603,6 +603,10 @@ if __name__ == "__main__":
 
     args, remaining = parser.parse_known_args()
 
+    return args, remaining
+
+
+def runner(args, remaining):
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 
@@ -710,3 +714,9 @@ if __name__ == "__main__":
         code = 1
 
     sys.exit(code)
+
+
+if __name__ == "__main__":
+    args, remaining = setup_args()
+    runner(args, remaining)
+
