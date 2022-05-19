@@ -358,6 +358,17 @@ def containers(kobj: KObject) -> Iterator[str]:
         return columns(head(lines))
 
 
+def image(kobj: KObject) -> str:
+    if kobj.is_pod:
+        raise NotImplementedError("Only deployment supported")
+    elif kobj.is_deployment:
+        jsonpath = "jsonpath={$.spec.template.spec.containers..image}"
+    with kubectl(
+        "get", "-n", kobj.namespace, kobj.type_, kobj.name, "-o", jsonpath, capture=True
+    ) as lines:
+        return columns(head(lines))
+
+
 def primary_container(kobj: KObject) -> Optional[str]:
     skip = {"linkerd", "linkerd-proxy"}
     return head([c for c in containers(kobj) if c not in skip])
@@ -507,6 +518,7 @@ if __name__ == "__main__":
                 ],
             ),
             NV("pods", "List pods"),
+            NV("image", "Show deployment image"),
             NV("exec", "Run something"),
             NV("env", "Print envvars"),
             NV("logs", "View logs"),
@@ -622,6 +634,7 @@ if __name__ == "__main__":
             )
         ),
         "describe": singleton_only(lambda last: describe(inspect(last))),
+        "image": singleton_only(lambda last: image(inspect(last))),
         "env": singleton_only(
             lambda last: exec(
                 inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
