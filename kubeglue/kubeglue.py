@@ -57,6 +57,10 @@ def require(predicate: bool, message: str):
         abort(message)
 
 
+def is_primitive(thing) -> bool:
+    return isinstance(thing, (type(None), bool, float, int, str))
+
+
 class SingleValueException(Exception):
     def __init__(self):
         super().__init__(
@@ -159,15 +163,11 @@ def inspect(*args):
 
 
 def display(*args, index=None, json=False):
-    def is_primitive(thing) -> bool:
-        return isinstance(thing, (type(None), bool, float, int, str))
-
     def prepare(thing, json: bool = False) -> str:
         if json:
             return pyjson.dumps(thing) if is_primitive(thing) else thing.to_json()
         else:
             return thing if is_primitive(thing) else repr(thing)
-
     if len(args) == 1:
         print(prepare(args[0], json=json))
     else:
@@ -236,29 +236,32 @@ def take(lines: Iterator[str], n: int) -> Optional[str]:
     return None
 
 
+def has_second(g):
+    it = iter(g)
+    first_end, second_end = object(), object()
+    first = next(it, first_end)
+    if first == first_end:
+        return False
+    return next(it, second_end) != second_end
+
+
+def require_singleton(f):
+    @functools.wraps(f)
+    def g(x):
+        if iterable(x):
+            xs = list(x)
+            if has_second(xs):
+                raise SingleValueException
+            # If nothing left, return None to stop
+            return None if len(xs) == 0 else f(head(xs))
+        else:
+            return f(x)
+    return g
+
+
 def singleton_only(thing):
-    def has_second(g):
-        it = iter(g)
-        first_end, second_end = object(), object()
-        first = next(it, first_end)
-        if first == first_end:
-            return False
-        return next(it, second_end) != second_end
-
     if callable(thing):
-
-        @functools.wraps(thing)
-        def f(x):
-            if iterable(x):
-                xs = list(x)
-                if has_second(xs):
-                    raise SingleValueException
-                # If nothing left, return None to stop
-                return None if len(xs) == 0 else thing(head(xs))
-            else:
-                return thing(x)
-
-        return f
+        return require_singleton(thing)
     elif iterable(thing):
         xs = list(thing)
         if has_second(xs):
@@ -280,7 +283,7 @@ def columns(line: str) -> List[str]:
     return line.split()
 
 
-def get_pods(selector: Optional[str] = None) -> Iterator[KObject]:
+async def get_pods(selector: Optional[str] = None) -> Iterator[KObject]:
     headers = ["namespace", "name", "ready", "status", "restarts", "age"]
     with_selector = [f"--selector={selector}"] if selector is not None else []
     with kubectl(
@@ -291,7 +294,7 @@ def get_pods(selector: Optional[str] = None) -> Iterator[KObject]:
         )
 
 
-def get_deployments() -> Iterator[KObject]:
+async def get_deployments() -> Iterator[KObject]:
     headers = [
         "namespace",
         "name",
@@ -313,7 +316,7 @@ def get_deployments() -> Iterator[KObject]:
         )
 
 
-def grep_objects(
+async def grep_objects(
     pattern: str, kobjs: Iterator[KObject], transform=lambda o: o.line
 ) -> Iterator[KObject]:
     # it's useful to prepend+append "*" to the pattern if they're not there because
@@ -327,26 +330,26 @@ def grep_objects(
     return (o for o in kobjs if re.search(regex, transform(o)))
 
 
-def grep_pods(
+async def grep_pods(
     pattern: Union[str, KObject], kobj: Optional[KObject] = None
 ) -> Iterator[KObject]:
     if kobj is not None:
         require(kobj.is_deployment, "deployment object expected")
-        pods = get_pods(kobj.selector)
+        pods = await get_pods(kobj.selector)
     else:
-        pods = get_pods()
-    return grep_objects(pattern, pods)
+        pods = await get_pods()
+    return await grep_objects(pattern, pods)
 
 
-def grep_deployments(pattern: str) -> Iterator[KObject]:
-    return grep_objects(pattern, get_deployments())
+async def grep_deployments(pattern: str) -> Iterator[KObject]:
+    return await grep_objects(pattern, await get_deployments())
 
 
 def describe(kobj: KObject) -> Iterator[str]:
     return (f"{key}: {value}" for key, value in kobj.attributes.items())
 
 
-def containers(kobj: KObject) -> Iterator[str]:
+async def containers(kobj: KObject) -> Iterator[str]:
     if kobj.is_pod:
         jsonpath = "jsonpath={.spec.containers[*].name}"
     elif kobj.is_deployment:
@@ -359,7 +362,7 @@ def containers(kobj: KObject) -> Iterator[str]:
         return columns(head(lines))
 
 
-def image(kobj: KObject) -> str:
+async def image(kobj: KObject) -> str:
     if kobj.is_pod:
         raise NotImplementedError("Only deployment supported")
     elif kobj.is_deployment:
@@ -370,24 +373,24 @@ def image(kobj: KObject) -> str:
         return columns(head(lines))
 
 
-def primary_container(kobj: KObject) -> Optional[str]:
+async def primary_container(kobj: KObject) -> Optional[str]:
     skip = {"linkerd", "linkerd-proxy"}
-    return head([c for c in containers(kobj) if c not in skip])
+    return head([c for c in await containers(kobj) if c not in skip])
 
 
-def primary_pod(kobj: KObject) -> KObject:
+async def primary_pod(kobj: KObject) -> KObject:
     if kobj.is_pod:
         return kobj
     else:
         # assumed to be a deployment:
-        return singleton_only(get_pods(kobj.selector))
+        return singleton_only(await get_pods(kobj.selector))
 
 
-def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
-    container = primary_container(kobj)
+async def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
+    container = await primary_container(kobj)
     with_container = ["-c", container] if container else []
 
-    pod = primary_pod(kobj)
+    pod = await primary_pod(kobj)
 
     with kubectl(
         "cp",
@@ -399,7 +402,7 @@ def copy(kobj: KObject, src: str, dest: str) -> CompletedProcess:
         return proc
 
 
-def port_forward(kobj: KObject, fwd_spec: PortForward) -> CompletedProcess:
+async def port_forward(kobj: KObject, fwd_spec: PortForward) -> CompletedProcess:
     if fwd_spec.has_remote_ip:
         raise NotImplementedError(
             "Port forwarding with remote IP is not a pod or deployment operation.\n"
@@ -416,10 +419,10 @@ def port_forward(kobj: KObject, fwd_spec: PortForward) -> CompletedProcess:
             return proc
 
 
-def exec(
+async def exec(
     kobj: KObject, command, stdin: bool = True, tty: bool = True, host_env: bool = False
 ):
-    container = primary_container(kobj)
+    container = await primary_container(kobj)
     with_container = ["-c", container] if container else []
 
     env = {}
@@ -459,9 +462,9 @@ def exec(
         return proc
 
 
-def logs(kobj: KObject, rest=[]) -> CompletedProcess:
+async def logs(kobj: KObject, rest=[]) -> CompletedProcess:
 
-    container = primary_container(kobj)
+    container = await primary_container(kobj)
     with_container = ["-c", container] if container else []
 
     with kubectl(
@@ -606,9 +609,108 @@ def setup_args():
     return args, remaining
 
 
-def runner(args, remaining):
+async def runner(args, remaining):
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
+
+    if args.verbose:
+        log.info(args)
+        log.info(remaining)
+
+    @require_singleton
+    async def do_containers(last):
+        return await containers(inspect(last))
+
+    @require_singleton
+    async def do_cp(last):
+        return await copy(inspect(last), args.src, args.dest)
+
+    @require_singleton
+    async def do_describe(last):
+        return await describe(inspect(last))
+
+    async def do_deployments(last):
+        return await grep_deployments(args.pattern)
+
+    @require_singleton
+    async def do_env(last):
+        return await exec(
+            inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
+        )
+
+    @require_singleton
+    async def do_exec(last):
+        return await exec(
+            inspect(last),
+            tokenize(args.rest) + tokenize(remaining),
+            stdin=args.stdin,
+            tty=args.tty,
+        )
+
+    @require_singleton
+    async def do_image(last):
+        return await image(inspect(last))
+
+    async def do_pods(last):
+        return await grep_pods(args.pattern, inspect(last))
+
+    @require_singleton
+    async def do_logs(last):
+        return await logs(inspect(last), tokenize(args.rest) + tokenize(remaining))
+
+    @require_singleton
+    async def do_port_forward(last):
+        return await port_forward(inspect(last), PortForward.parse(args.portspec))
+
+    @require_singleton
+    async def do_shell(last):
+        return await exec(
+            inspect(last), tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty
+        )
+
+    @require_singleton
+    async def do_psql(last):
+        return (
+            await port_forward(
+                inspect(last), PortForward.parse(f"{args.forward}:{POSTGRES_PORT}")
+            )
+            if args.forward is not None
+            else await exec(
+                inspect(args, last),
+                lambda env: ["psql"]
+                + (["--quiet", "-t"] if not args.verbose else [])
+                + ["-U", find_postgres_user(env)],
+                stdin=args.stdin,
+                tty=args.tty,
+                host_env=True,
+            )
+        )
+
+    @require_singleton
+    async def do_pg_dump_schema(last):
+        return await exec(
+            inspect(last),
+            lambda env: tokenize(f"pg_dump -s -U {find_postgres_user(env)}"),
+            stdin=args.stdin,
+            tty=args.tty,
+            host_env=True,
+        )
+
+    actions = {
+        "containers": do_containers,
+        "cp": do_cp,
+        "deployments": do_deployments,
+        "describe": do_describe,
+        "env": do_env,
+        "exec": do_exec,
+        "image": do_image,
+        "logs": do_logs,
+        "pods": do_pods,
+        "pg-dump-schema": do_pg_dump_schema,
+        "port-forward": do_port_forward,
+        "psql": do_psql,
+        "shell": do_shell,
+    }
 
     do_next = []
     if (noun := getattr(args, "noun", None)) is not None:
@@ -620,74 +722,13 @@ def runner(args, remaining):
         parser.print_help()
         sys.exit(0)
 
-    if args.verbose:
-        log.info(args)
-        log.info(remaining)
-
-    actions = {
-        "pods": lambda last: grep_pods(args.pattern, inspect(last)),
-        "deployments": lambda _: grep_deployments(args.pattern),
-        "containers": singleton_only(lambda last: containers(inspect(last))),
-        "cp": singleton_only(lambda last: copy(inspect(last), args.src, args.dest)),
-        "exec": singleton_only(
-            lambda last: exec(
-                inspect(last),
-                tokenize(args.rest) + tokenize(remaining),
-                stdin=args.stdin,
-                tty=args.tty,
-            )
-        ),
-        "describe": singleton_only(lambda last: describe(inspect(last))),
-        "image": singleton_only(lambda last: image(inspect(last))),
-        "env": singleton_only(
-            lambda last: exec(
-                inspect(last), tokenize("env"), stdin=args.stdin, tty=args.tty
-            )
-        ),
-        "logs": singleton_only(
-            lambda last: logs(inspect(last), tokenize(args.rest) + tokenize(remaining))
-        ),
-        "port-forward": singleton_only(
-            lambda last: port_forward(inspect(last), PortForward.parse(args.portspec))
-        ),
-        "shell": singleton_only(
-            lambda last: exec(
-                inspect(last), tokenize("/bin/sh"), stdin=args.stdin, tty=args.tty
-            )
-        ),
-        "psql": singleton_only(
-            lambda last: port_forward(
-                inspect(last), PortForward.parse(f"{args.forward}:{POSTGRES_PORT}")
-            )
-            if args.forward is not None
-            else exec(
-                inspect(args, last),
-                lambda env: ["psql"]
-                + (["--quiet", "-t"] if not args.verbose else [])
-                + ["-U", find_postgres_user(env)],
-                stdin=args.stdin,
-                tty=args.tty,
-                host_env=True,
-            )
-        ),
-        "pg-dump-schema": singleton_only(
-            lambda last: exec(
-                inspect(last),
-                lambda env: tokenize(f"pg_dump -s -U {find_postgres_user(env)}"),
-                stdin=args.stdin,
-                tty=args.tty,
-                host_env=True,
-            )
-        ),
-    }
-
     output, code, index = None, 0, args.index
 
     while len(do_next) > 0:
         if (thing_to_do := do_next.pop(0)) is None:
             break
         try:
-            output = actions[thing_to_do](output)
+            output = await actions[thing_to_do](output)
             if output is None:
                 break
         except SingleValueException as e:
@@ -718,5 +759,4 @@ def runner(args, remaining):
 
 if __name__ == "__main__":
     args, remaining = setup_args()
-    runner(args, remaining)
-
+    asyncio.run(runner(args, remaining))
