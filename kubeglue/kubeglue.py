@@ -550,6 +550,7 @@ def setup_args():
                     )
                 ],
             ),
+            NV("pg-dump", "Dump a Postgres database"),
             NV("pg-dump-schema", "Dump the schema of a Postgres database"),
         ]
         for v in verbs:
@@ -687,6 +688,16 @@ async def runner(args, remaining):
         )
 
     @require_singleton
+    async def do_pg_dump(last):
+        return await exec(
+            inspect(last),
+            lambda env: tokenize(f"pg_dump -U {find_postgres_user(env)} --column-inserts") + tokenize(remaining),
+            stdin=args.stdin,
+            tty=args.tty,
+            host_env=True,
+        )
+
+    @require_singleton
     async def do_pg_dump_schema(last):
         return await exec(
             inspect(last),
@@ -706,6 +717,7 @@ async def runner(args, remaining):
         "image": do_image,
         "logs": do_logs,
         "pods": do_pods,
+        "pg-dump": do_pg_dump,
         "pg-dump-schema": do_pg_dump_schema,
         "port-forward": do_port_forward,
         "psql": do_psql,
