@@ -2,23 +2,16 @@
 
 import asyncio
 import argparse
-import functools
-from copy import deepcopy
 from contextlib import contextmanager
 from collections.abc import Iterable
-from itertools import chain, tee
-import fnmatch
-import re
 import json as pyjson
-import os
 import sys
 import shlex
 import json
+from itertools import islice
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 from subprocess import Popen, PIPE, STDOUT
-from functools import partial
-from io import TextIOWrapper
 import logging
 import sys
 import inspect
@@ -26,6 +19,26 @@ import pprint
 
 
 log = logging.getLogger("glue")
+
+
+@contextmanager
+def color(*names):
+    reset = '\033[0m'
+    colors = {
+        "black": 30,
+        "red": 31,
+        "green": 32,
+        "yellow": 33,
+        "blue": 34,
+        "magenta": 35,
+        "cyan": 36,
+        "white": 37
+    }
+    def colorize(name):
+        color = colors[name]
+        code = f"\033[{color}m"
+        return lambda *text: f"{code}{''.join(text)}{reset}"
+    yield [colorize(name) for name in names]
 
 
 @dataclass(repr=False)
@@ -77,7 +90,8 @@ class KObject:
 @contextmanager
 def kubectl(*args, **kwargs):
     stdout = kwargs.pop("stdout") if "stdout" in kwargs else PIPE
-    log.warning(f"!EXECUTE: kubectl {' '.join(args)}")
+    with color("green") as (c,):
+        log.warning(f"{c('EXECUTE')}: kubectl {' '.join(args)}")
     with Popen(["kubectl", *args], stdout=stdout, **kwargs) as proc:
         yield proc
 
@@ -91,16 +105,17 @@ def cond_arg(test, *args, default=[]):
 
 
 @contextmanager
-def fzf(pipe_in, *args, query=None, **kwargs):
+def fzf(pipe_in, *args, query=None, tac=False, **kwargs):
     text = kwargs.pop("text") if "text" in kwargs else True
-    with_query = cond_arg(query, "--query", query)
+    with_query = cond_arg(query, "--query")
+    with_tac = cond_arg(tac, "--tac")
     with Popen(
         [
             "fzf",
             "--cycle",
             "--multi",
             "--layout=reverse-list",
-            "--tac",
+            *with_tac,
             "--height=~50%",
             *with_query,
             *args,
@@ -131,6 +146,10 @@ def first(thing):
     return thing
 
 
+def skip(lines: Iterator[str], n: int) -> Iterator[str]:
+    return next(islice(lines, n, n))
+
+
 def take(lines: Iterator[str], n: int) -> Optional[str]:
     for i, line in enumerate(lines, start=1):
         if i == n:
@@ -155,12 +174,22 @@ def unlines(pieces: Iterable[Union[str, bytes]]) -> str:
     )
 
 
-def menu(*items: str) -> str:
+def columns(line: str) -> Iterable[str]:
+    for column in line.split():
+        yield column
+
+
+def column(lines: Iterator[str], index: int) -> Iterator[str]:
+    for line in lines:
+        yield next(take(columns(line), index))
+
+
+def pick(*items: str) -> str:
     with fzf(PIPE) as p:
         out, err = p.communicate(unlines(reversed(items)))
         if err:
-            raise ValueError(err)
-        return out.strip()
+            error(err)
+    return out.strip()
 
 
 def pretty_json(thing):
@@ -171,21 +200,29 @@ def pretty_json(thing):
     print(json.dumps(out, indent=4))
 
 
-# def flatten(list_of_lists):
-#     return chain.from_iterable(list_of_lists)
-
-
 def find_postgres_user(env: Dict[str, str]) -> str:
     candidates = ["POSTGRES_USER", "PG_USER", "DB_USER"]
     for candidate in candidates:
         if candidate in env:
             return env[candidate]
-    raise Exception("env:no postgres user found")
+    error("env:no postgres user found")
 
 
-def columns(line: str) -> Iterable[str]:
-    for column in line.split():
-        yield column
+async def choose_namespace() -> Iterator[str]:
+    """
+    List all namespaces, picking one.
+    """
+    headers = [
+        "name",
+        "status",
+        "age",
+    ]
+
+    with kubectl("get", "namespaces") as p1:
+        with fzf(p1.stdout) as p2:
+            if not p2.stdout:
+                error("Missing stdout")
+            #await skip(lines(p2.stdout), 1)
 
 
 async def choose_pods(
@@ -212,6 +249,8 @@ async def choose_pods(
         text=True,
     ) as p1:
         with fzf(p1.stdout) as p2:
+            if not p2.stdout:
+                error("Missing stdout")
             return iter([KObject.pod(line, headers) for line in p2.stdout])
 
 
@@ -237,6 +276,8 @@ async def choose_deployments(namespace: Optional[str] = None) -> Iterator[KObjec
         text=True,
     ) as p1:
         with fzf(p1.stdout) as p2:
+            if not p2.stdout:
+                error("Missing stdout")
             return iter([KObject.deployment(line, headers) for line in p2.stdout])
 
 
@@ -253,12 +294,43 @@ async def choose_containers(kobj: KObject) -> Iterator[str]:
     with kubectl(
         "get", "-n", kobj.namespace, kobj.type_, kobj.name, "-o", jsonpath
     ) as p1:
+        if not p1.stdout:
+            error("Missing stdout")
         containers = unlines(columns(first(p1.stdout)))
         with fzf(PIPE) as p2:
             containers_line, err = p2.communicate(containers)
             if err is not None:
                 error(err)
             return iter(c.strip() for c in containers_line.split("\n"))
+
+
+async def command_db(args, remaining):
+    """
+    Connect to a Figure database and open a psql prompt.
+    """
+    namespace = args.get("namespace")
+    selector = args.get("selector")
+    tail = args.get("tail", False)
+    choice = pick("pod", "deployment")
+    if choice == "pod":
+        chosen = await choose_pods(namespace, selector)
+    elif choice == "deployment":
+        chosen = await choose_deployments(namespace)
+    else:
+        raise NotImplementedError
+
+    kobj = first(chosen)
+    containers = await choose_containers(kobj)
+    container = first(containers)
+
+    env = await command_env(args, remaining, kobj=kobj, container=container, quiet=True)
+    db_user = find_postgres_user(env)
+
+    args["cmd"] = f"""/usr/bin/psql -U {db_user}"""
+    args["stdin"] = True
+    args["tty"] = True
+
+    await command_exec(args, remaining, kobj=kobj, container=container)
 
 
 async def command_exec(args, remaining, kobj=None, container=None, stdout=None, f=None):
@@ -268,6 +340,7 @@ async def command_exec(args, remaining, kobj=None, container=None, stdout=None, 
     namespace = args.get("namespace")
     selector = args.get("selector")
     tty = (args.get("tty"),)
+
     if not kobj:
         pods = await choose_pods(namespace, selector)
         kobj = first(pods)
@@ -323,34 +396,26 @@ async def command_env(args, remaining, kobj=None, container=None, quiet=False):
     return e
 
 
-async def command_shell(args, remaining, kobj=None, container=None):
-    """
-    Execute a shell.
-    """
-    args["cmd"] = "/bin/bash"
-    args["stdin"] = True
-    args["tty"] = True
-    await command_exec(args, remaining, kobj=kobj, container=container)
-
-
-async def command_logs(args, remaining):
+async def command_logs(args, remaining, kobj=None, container=None):
     """
     Stream kubectl logs.
     """
     namespace = args.get("namespace")
     selector = args.get("selector")
     tail = args.get("tail", False)
-    choice = menu("pod", "deployment")
-    if choice == "pod":
-        chosen = await choose_pods(namespace, selector)
-    elif choice == "deployment":
-        chosen = await choose_deployments(namespace)
-    else:
-        raise NotImplementedError
 
-    kobj = first(chosen)
-    containers = await choose_containers(kobj)
-    container = first(containers)
+    if not kobj:
+        choice = pick("pod", "deployment")
+        if choice == "pod":
+            chosen = await choose_pods(namespace, selector)
+        elif choice == "deployment":
+            chosen = await choose_deployments(namespace)
+        else:
+            raise NotImplementedError
+        kobj = first(chosen)
+    if not container:
+        containers = await choose_containers(kobj)
+        container = first(containers)
 
     with kubectl(
         "logs",
@@ -377,33 +442,21 @@ async def command_logs(args, remaining):
             p.stdout.close()
 
 
-async def command_db(args, remaining):
+async def command_port_forward(args, remaining, kobj=None, container=None):
+    pass
+
+
+async def command_shell(args, remaining, kobj=None, container=None):
     """
-    Connect to a Figure database and open a psql prompt.
+    Execute a shell.
     """
-    namespace = args.get("namespace")
-    selector = args.get("selector")
-    tail = args.get("tail", False)
-    choice = menu("pod", "deployment")
-    if choice == "pod":
-        chosen = await choose_pods(namespace, selector)
-    elif choice == "deployment":
-        chosen = await choose_deployments(namespace)
-    else:
-        raise NotImplementedError
-
-    kobj = first(chosen)
-    containers = await choose_containers(kobj)
-    container = first(containers)
-
-    env = await command_env(args, remaining, kobj=kobj, container=container, quiet=True)
-    db_user = find_postgres_user(env)
-
-    args["cmd"] = f"""/usr/bin/psql -U {db_user}"""
+    args["cmd"] = "/bin/bash"
     args["stdin"] = True
     args["tty"] = True
-
     await command_exec(args, remaining, kobj=kobj, container=container)
+
+
+###############################################################################
 
 
 def setup_args() -> Tuple[str, Dict[str, Any], List[str]]:
@@ -484,26 +537,30 @@ def setup_args() -> Tuple[str, Dict[str, Any], List[str]]:
 async def runner(command: str, args: Dict[str, Any], remaining: list[str]):
 
     verbose = args.get("verbose", False)
+    namespace = args.get("namespace")
 
     if verbose:
         logging.basicConfig(level=logging.INFO)
 
-    command_functions = {
-        name: obj
-        for (name, obj) in inspect.getmembers(sys.modules[__name__])
-        if (
-            inspect.isfunction(obj)
-            and name.startswith("command_")
-            and obj.__module__ == __name__
-        )
-    }
-    command_name = f"command_{command}"
-    if command_name not in command_functions:
-        print(f"Invalid command: {command}")
-        sys.exit(1)
+    if not namespace:
+        await choose_namespace()
 
-    f = command_functions[command_name]
-    await f(args, remaining)
+    # command_functions = {
+    #     name: obj
+    #     for (name, obj) in inspect.getmembers(sys.modules[__name__])
+    #     if (
+    #         inspect.isfunction(obj)
+    #         and name.startswith("command_")
+    #         and obj.__module__ == __name__
+    #     )
+    # }
+    # command_name = f"command_{command}"
+    # if command_name not in command_functions:
+    #     print(f"Invalid command: {command}")
+    #     sys.exit(1)
+    #
+    # f = command_functions[command_name]
+    # await f(args, remaining)
 
     sys.exit(0)
 
